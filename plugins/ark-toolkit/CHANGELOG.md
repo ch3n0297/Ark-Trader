@@ -3,6 +3,12 @@
 本檔記錄 ark-toolkit 的版本沿革。版本語意：主版號＝正式里程碑，
 次版號＝行為或語意變更，修訂號＝bug 修正。
 
+## [Unreleased]
+
+- 測試：`test_daily` 以模組層 `setUpModule` 把 `daily.STATE`／`LOG` 指到暫存目錄，
+  `guard_gates` 等會寫日誌的路徑不再落到使用者的 `~/.ark-toolkit/agent/daily.log`
+  （自 2026-09-09 起正式日誌已混進 42 行 `[test]` 還原訊息）；`TestLogIsolation` 守住。
+
 ## [2.0.0] - 2026-10-13
 
 - **ark-sync 的 ARK 現況主來源改為 API**。原本以調節庫存頁翻頁（`ark.read_holdings`）

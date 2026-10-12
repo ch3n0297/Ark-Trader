@@ -8,6 +8,22 @@ from unittest import mock
 import daily
 
 
+def setUpModule():
+    """整個模組的 daily.STATE／LOG 指到暫存目錄：測試絕不寫進使用者的 ~/.ark-toolkit/agent。"""
+    global _state_dir, _patches
+    _state_dir = tempfile.TemporaryDirectory()
+    _patches = [mock.patch.object(daily, "STATE", _state_dir.name),
+                mock.patch.object(daily, "LOG", os.path.join(_state_dir.name, "daily.log"))]
+    for p in _patches:
+        p.start()
+
+
+def tearDownModule():
+    for p in _patches:
+        p.stop()
+    _state_dir.cleanup()
+
+
 class TestIsTradingWeekday(unittest.TestCase):
     def test_平日為真(self):
         for d in ("2026-08-10", "2026-08-11", "2026-08-12", "2026-08-13",
@@ -243,6 +259,24 @@ class TestGatesGuard(unittest.TestCase):
             self.assertFalse(daily.guard_gates(p, before, mode="test"))
             with open(p, encoding="utf-8") as fh:
                 self.assertEqual(json.load(fh), after)
+
+
+class TestLogIsolation(unittest.TestCase):
+    """測試絕不能寫進使用者的真實 ~/.ark-toolkit/agent/daily.log（自 2026-09-09 起實際外漏 42 行）"""
+
+    def test_日誌不落在使用者目錄(self):
+        self.assertFalse(daily.LOG.startswith(os.path.expanduser("~/.ark-toolkit")),
+                         f"daily.LOG 仍指向使用者目錄：{daily.LOG}")
+
+    def test_還原理由寫進日誌(self):
+        import gates
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "gates.json")
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps({**gates.DEFAULTS, "name_cap": 0.30}))
+            daily.guard_gates(p, json.dumps(gates.DEFAULTS), mode="test")
+        with open(daily.LOG, encoding="utf-8") as fh:
+            self.assertIn("[test] ⚠️ gates.json 被改到區間或步幅之外，已還原：name_cap", fh.read())
 
 
 class TestDecidePromptMentionsSatelliteBucket(unittest.TestCase):
