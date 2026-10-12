@@ -83,6 +83,73 @@ class TestParsers(unittest.TestCase):
         self.assertEqual(arkapi.parse_cash(payload), (75443.0, 0.0))
 
 
+ZONE_PAYLOAD = {
+    "code": "0000", "message": "操作成功",
+    "title": ["股票代號", "即時股價", "即時漲跌幅", "股票名稱", "(營收)單月營收變動%",
+              "(營收)單月營收成長%", "(營收)累計月營收成長%", "(利潤)毛利率%",
+              "(利潤)營業利益率%", "(利潤)稅後純益率%", "(負債)負債比率%", "(負債)流動比率%",
+              "(負債)速動比率%", "(現金流)營業活動變動%", "(現金流)自由現金變動%",
+              "連續配息", "產業別", "K(9)"],
+    "data": [
+        ["6274", "", "", "台燿", "0.11", "132.48", "97.01", "29.72", "23.48", "16.37",
+         "48.55", "205.37", "149.06", "-54.41", "-159.09", "23", "PCB-製造", "21.2432"],
+        ["2855", "", "", "統一證", "", "", "", "89.94", "48.68", "76.87",
+         "87.34", "112.56", "108.65", "-1371.40", "39.79", "9", "金融-證券", "93.5475"],
+    ],
+}
+
+
+class TestZone(unittest.TestCase):
+    def test_產業分區列轉成代號索引的指標(self):
+        z = arkapi.parse_zone(ZONE_PAYLOAD)
+        self.assertEqual(set(z), {"6274", "2855"})
+        self.assertEqual(z["6274"]["name"], "台燿")
+        self.assertEqual(z["6274"]["sector"], "PCB-製造")
+        self.assertAlmostEqual(z["6274"]["rev_yoy"], 132.48)
+        self.assertAlmostEqual(z["6274"]["gross_margin"], 29.72)
+        self.assertEqual(z["6274"]["dividend_years"], 23)
+        self.assertAlmostEqual(z["6274"]["k9"], 21.2432)
+
+    def test_空字串欄位是_None_不是零(self):
+        # 金融股沒有營收欄，空字串必須保留為缺值，否則排序會把它當成營收零成長
+        z = arkapi.parse_zone(ZONE_PAYLOAD)
+        self.assertIsNone(z["2855"]["rev_yoy"])
+        self.assertAlmostEqual(z["2855"]["net_margin"], 76.87)
+
+    def test_zone_走白名單內的路徑(self):
+        sess = arkapi.Session(token=jwt(NOW + dt.timedelta(days=1)), member_id="1" * 20,
+                              device_token="dev", expires=NOW + dt.timedelta(days=1))
+        seen = {}
+
+        def fetch(url, headers, body):
+            seen["url"] = url
+            seen["body"] = body
+            return ZONE_PAYLOAD
+        z = arkapi.zone(sess, arkapi.INDUSTRY_VALUE, fetch=fetch, now=NOW)
+        self.assertIn("/api/st/10?", seen["url"])
+        # 這個端點對 GET 回 405，必須是 POST 空 JSON 物件
+        self.assertEqual(seen["body"], {})
+        self.assertIn("6274", z)
+
+    def test_分區以外的_st_路徑仍被拒(self):
+        sess = arkapi.Session(token=jwt(NOW + dt.timedelta(days=1)), member_id="1" * 20,
+                              device_token="dev", expires=NOW + dt.timedelta(days=1))
+        with self.assertRaises(ValueError):
+            arkapi.call(sess, "api/st/10/delete", fetch=lambda *a, **k: {}, now=NOW)
+
+
+class TestEndpointLabel(unittest.TestCase):
+    """錯誤訊息只能露出端點名稱，不能露出查詢字串（deviceToken 在裡面）——
+    packet.py 會把 str(e) 原封不動存進明文 packet JSON。"""
+
+    def test_只取路徑最後一段_不含查詢字串裡的_deviceToken(self):
+        url = "https://host/dashaWulinApi/api/st/10?deviceType=I&deviceToken=abc"
+        label = arkapi._endpoint_label(url)
+        self.assertEqual(label, "10")
+        self.assertNotIn("deviceToken", label)
+        self.assertNotIn("abc", label)
+
+
 class TestReadOnlyGuard(unittest.TestCase):
     """這個模組是唯讀的。寫入端點存在且格式已知，但**不從這裡走**——
     要走得經過使用者同意、另外設計驗證（AX 寫入有 App 自算總成本當獨立見證，

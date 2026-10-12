@@ -39,6 +39,7 @@ READ_ONLY = {
     "api/calculateRisk/memberMoney",     # 台幣／美元現金
     "api/myStock/{member_id}",           # 庫存
     "api/st/ids",                        # 策略分區清單
+    "api/st/{zone_id}",                  # 策略分區內容（產業價值區 10、產業升溫區 6…）
 }
 EXPIRY_MARGIN = dt.timedelta(seconds=60)   # 剩這麼點時間就別開始了
 
@@ -148,6 +149,12 @@ def session(now=None) -> Session:
 
 # --- 呼叫 -------------------------------------------------------------------
 
+def _endpoint_label(url):
+    """錯誤訊息只能露出端點名稱——URL 的查詢字串裡有 deviceToken，
+    不能整條塞進 ArkApiError（packet.py 會把訊息原封不動存進明文 packet JSON）。"""
+    return urllib.parse.urlsplit(url).path.rsplit("/", 1)[-1]
+
+
 def _fetch(url, headers, body):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, headers=headers, method="POST" if data else "GET")
@@ -155,7 +162,7 @@ def _fetch(url, headers, body):
         with urllib.request.urlopen(req, timeout=15) as resp:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
-        raise ArkApiError(f"{url.rsplit('/', 1)[-1]} 回應 HTTP {e.code}") from e
+        raise ArkApiError(f"{_endpoint_label(url)} 回應 HTTP {e.code}") from e
     except urllib.error.URLError as e:
         raise ArkApiError(f"連不上 ARK 伺服器：{e.reason}") from e
 
@@ -163,6 +170,7 @@ def _fetch(url, headers, body):
 def call(sess, path, body=None, query=None, fetch=_fetch, now=None):
     """送出一次**查詢**。path 必須在 READ_ONLY 白名單裡，否則拒絕。"""
     template = re.sub(r"/\d{18,22}(?=/|$)", "/{member_id}", path)
+    template = re.sub(r"^api/st/\d{1,3}$", "api/st/{zone_id}", template)
     if template not in READ_ONLY:
         raise ValueError(f"arkapi 是唯讀的，不送 {path}（白名單：{sorted(READ_ONLY)}）")
     if not token_valid(sess.token, now=now):
@@ -229,3 +237,44 @@ def cash(sess, **kw):
 
 def positions(sess, **kw):
     return parse_positions(call(sess, f"api/myStock/{sess.member_id}", body={}, **kw))
+
+
+INDUSTRY_VALUE = "10"      # api/st/ids 回的策略 ID：產業價值區
+INDUSTRY_HEATING = "6"     # 產業升溫區
+
+_ZONE_FIELDS = {
+    "股票名稱": ("name", str),
+    "產業別": ("sector", str),
+    "(營收)單月營收變動%": ("rev_mom", float),
+    "(營收)單月營收成長%": ("rev_yoy", float),
+    "(營收)累計月營收成長%": ("rev_ytd", float),
+    "(利潤)毛利率%": ("gross_margin", float),
+    "(利潤)營業利益率%": ("op_margin", float),
+    "(利潤)稅後純益率%": ("net_margin", float),
+    "(負債)負債比率%": ("debt_ratio", float),
+    "連續配息": ("dividend_years", int),
+    "K(9)": ("k9", float),
+}
+
+
+def _opt(v, typ):
+    """空字串是缺值（金融股沒有營收欄），不能變成 0——排序會把它當零成長。"""
+    if v in (None, ""):
+        return None
+    return typ(_num(v)) if typ is not str else str(v)
+
+
+def parse_zone(payload):
+    """策略分區（產業價值區／升溫區）→ {代號: 指標}。欄位名對不上就缺欄，不猜。"""
+    out = {}
+    for row in rows(payload):
+        code = row.get("股票代號")
+        if not code:
+            continue
+        out[code] = {key: _opt(row.get(col), typ) for col, (key, typ) in _ZONE_FIELDS.items()}
+    return out
+
+
+def zone(sess, zone_id, body=None, **kw):
+    # 伺服器對這個端點只接受 POST，空 body 即可；GET 回 405
+    return parse_zone(call(sess, f"api/st/{zone_id}", body={} if body is None else body, **kw))

@@ -25,6 +25,7 @@ import json
 import math
 import os
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..", "..", "lib")))
@@ -34,6 +35,8 @@ import risk     # noqa: E402
 
 COMMON = "Common"
 INTRADAY_ODD = "IntradayOdd"
+AFTER_HOURS_ODD = "Odd"          # 盤後零股：13:40–14:30 收單、14:30 單一價撮合，單位：股
+ODD_MAX = 999
 SHARES_PER_LOT = 1000
 
 # (價格上界, 檔位)。ETF 兩段、個股六段——實證：帳戶內 00635U @ 45.03 落在
@@ -64,6 +67,22 @@ def split_shares(shares):
         out.append((COMMON, lots))
     if odd:
         out.append((INTRADAY_ODD, odd))
+    return out
+
+
+def split_shares_after_hours(shares):
+    """股數 → [(Odd, quantity)]，盤後零股每筆上限 999 股，超過就拆成多筆。
+
+    盤中補跑來不及時的補救通道（使用者 2026-08-21／09-10 認可）：整張也拆成
+    零股送，因為盤後零股盤沒有整股委託。
+    """
+    if shares < 0:
+        raise ValueError(f"股數不可為負：{shares}")
+    out = []
+    while shares > 0:
+        qty = min(shares, ODD_MAX)
+        out.append((AFTER_HOURS_ODD, qty))
+        shares -= qty
     return out
 
 
@@ -107,14 +126,17 @@ def limit_price(order, limits):
     return round_to_tick(clamped, is_etf(order["code"]), order["action"])
 
 
-def build_legs(order, limits):
-    """一筆決策 → 可直接送出的委託腿。`shares` 保留原始股數供成交對帳。"""
+def build_legs(order, limits, after_hours=False):
+    """一筆決策 → 可直接送出的委託腿。`shares` 保留原始股數供成交對帳。
+    `after_hours` 走盤後零股（全部以股計、每筆 ≤ 999）。"""
     price = limit_price(order, limits)
+    pieces = (split_shares_after_hours(order["qty"]) if after_hours
+              else split_shares(order["qty"]))
     return [{"code": order["code"], "action": order["action"],
              "order_lot": lot, "quantity": qty,
              "shares": qty * SHARES_PER_LOT if lot == COMMON else qty,
              "price": price}
-            for lot, qty in split_shares(order["qty"])]
+            for lot, qty in pieces]
 
 
 def execution_guard(orders, envelope, quotes, packet_hash):
@@ -175,7 +197,8 @@ def place_legs(api, legs):
     import shioaji as sj
 
     lots = {COMMON: sj.StockOrderLot.Common,
-            INTRADAY_ODD: sj.StockOrderLot.IntradayOdd}
+            INTRADAY_ODD: sj.StockOrderLot.IntradayOdd,
+            AFTER_HOURS_ODD: sj.StockOrderLot.Odd}
     actions = {"buy": sj.Action.Buy, "sell": sj.Action.Sell}
     out = []
     for leg in legs:
@@ -201,6 +224,57 @@ def contract_limits(api, code):
             "reference": float(c.reference)}
 
 
+# ---------------------------------------------------------------- 等成交
+
+# 委託不會再變的狀態。PartFilled 不算——剩下的量還掛著。
+TERMINAL_STATUSES = frozenset({"Filled", "Cancelled", "Failed", "Inactive"})
+
+
+def status_name(status):
+    """`OrderStatus.Filled` 或 'OrderStatus.Filled' → 'Filled'。"""
+    return str(status).rsplit(".", 1)[-1]
+
+
+def pending_seqnos(results, statuses):
+    """送出成功的腿裡，還沒到終態的 seqno。`statuses` = {seqno: 狀態}。
+
+    查不到狀態的腿保守視為未完成——寧可多等一輪，不可漏刪一筆還掛著的單。
+    """
+    return [r["seqno"] for r in results if r.get("ok")
+            and status_name(statuses.get(r["seqno"], "")) not in TERMINAL_STATUSES]
+
+
+def wait_for_fills(api, results, minutes, poll_seconds=20,
+                   clock=time.monotonic, sleep=time.sleep):
+    """輪詢委託直到全部終態或逾時；逾時仍掛著的腿刪單。回傳 (statuses, 刪單的 seqno)。
+
+    成交後要立刻結算當日（daily.py trade），「交易完成」必須有明確定義：
+    每一腿都成交或已刪。逾時不追價——R-008 的精神，也讓結算後不會再有帳外變化。
+    """
+    deadline = clock() + minutes * 60
+    while True:
+        api.update_status(api.stock_account)
+        trades = {t.order.seqno: t for t in api.list_trades()}
+        statuses = {s: status_name(t.status.status) for s, t in trades.items()}
+        pending = pending_seqnos(results, statuses)
+        if not pending:
+            return statuses, []
+        if clock() >= deadline:
+            break
+        sleep(poll_seconds)
+
+    cancelled = []
+    for seqno in pending:
+        trade = trades.get(seqno)
+        if trade is None:
+            continue
+        api.cancel_order(trade)
+        cancelled.append(seqno)
+    api.update_status(api.stock_account)
+    statuses = {t.order.seqno: status_name(t.status.status) for t in api.list_trades()}
+    return statuses, cancelled
+
+
 # ---------------------------------------------------------------- CLI
 
 def main():
@@ -215,6 +289,10 @@ def main():
                     help="只印出將送出的委託腿，不連線")
     ap.add_argument("--latest", action="store_true",
                     help="送同日最後一筆（amended）決策；預設送第一筆")
+    ap.add_argument("--after-hours", action="store_true",
+                    help="走盤後零股（13:40–14:30 收單、14:30 單一價）；盤中補跑來不及時用")
+    ap.add_argument("--wait", type=float, metavar="MINUTES",
+                    help="送單後留在線上等成交最多幾分鐘，逾時仍掛著的腿刪單（成交後立刻結算用）")
     args = ap.parse_args()
 
     date = args.date or dt.date.today().isoformat()
@@ -246,7 +324,7 @@ def main():
     if args.dry_run:
         with market.session() as api:
             for o in orders:
-                for leg in build_legs(o, contract_limits(api, o["code"])):
+                for leg in build_legs(o, contract_limits(api, o["code"]), args.after_hours):
                     print(f"  {leg['action']} {leg['code']} "
                           f"{leg['order_lot']} qty={leg['quantity']}"
                           f"（{leg['shares']} 股）@ {leg['price']}")
@@ -258,6 +336,7 @@ def main():
     api = sj.Shioaji(simulation=args.backend == "simulation")
     api.login(api_key=os.environ["SHIOAJI_API_KEY"],
               secret_key=os.environ["SHIOAJI_SECRET_KEY"])
+    statuses, cancelled = {}, []
     try:
         if args.backend == "live":
             activate_ca(api, os.environ["SHIOAJI_CA_PATH"],
@@ -265,15 +344,26 @@ def main():
                         api.stock_account.person_id)
         results = []
         for o in orders:
-            results += place_legs(api, build_legs(o, contract_limits(api, o["code"])))
+            results += place_legs(api, build_legs(o, contract_limits(api, o["code"]),
+                                                  args.after_hours))
         api.update_status(api.stock_account)
+        # 先落地再等：等待途中行程若死掉，日誌仍看得到哪幾腿已經送出去了
+        journal.append_entry({
+            "type": "execution", "date": date, "backend": args.backend,
+            "ts": dt.datetime.now().replace(microsecond=0).isoformat(),
+            "decision_lock": decision["lock"], "legs": results,
+            **({"channel": "after_hours_odd"} if args.after_hours else {})})
+        if args.wait:
+            statuses, cancelled = wait_for_fills(api, results, args.wait)
     finally:
         api.logout()
 
-    entry = {"type": "execution", "date": date, "backend": args.backend,
-             "ts": dt.datetime.now().replace(microsecond=0).isoformat(),
-             "decision_lock": decision["lock"], "legs": results}
-    journal.append_entry(entry)
+    if cancelled:
+        journal.append_entry({
+            "type": "cancel", "date": date,
+            "ts": dt.datetime.now().replace(microsecond=0).isoformat(),
+            "decision_lock": decision["lock"], "seqnos": cancelled,
+            "reason": f"送單後 {args.wait:g} 分未成交，刪單以便當日結算"})
 
     ok = sum(1 for r in results if r["ok"])
     print(f"{'✅' if ok == len(results) else '⚠️'} 送出 {ok}/{len(results)} 腿"
@@ -281,6 +371,9 @@ def main():
     for r in results:
         mark = "✓" if r["ok"] else "✗"
         detail = (f"id={r['order_id']} {r['status']}" if r["ok"] else r["error"])
+        if r["ok"] and args.wait:
+            final = statuses.get(r["seqno"], "?")
+            detail += f" → {final}" + ("（已刪單）" if r["seqno"] in cancelled else "")
         print(f"  {mark} {r['action']} {r['code']} {r['shares']} 股 @ {r['price']}"
               f"　{detail}")
     return 0 if ok == len(results) else 1

@@ -38,11 +38,13 @@ PACKET_DIR = os.path.expanduser("~/.ark-toolkit/agent/packets")
 SYNC_PY = os.path.abspath(os.path.join(HERE, "..", "ark-sync", "sync.py"))
 BENCHMARK = "0050"
 RECENT_CALENDAR_DAYS = 40      # 約 20 個交易日的回看視窗
+MARKET_CLOSED_EXIT = 3         # 休市：daily 視為「今天不交易」，不是故障
 
 # 決策準則檔：複盤累積下來、要餵回決策層的經驗。內容是個人化的（每個使用者的
 # 檢討結論不同），所以預設放執行資料夾，`ARK_RULES` 可指到專案內以便版控。
 RULES_PATH = os.environ.get(
     "ARK_RULES", os.path.expanduser("~/.ark-toolkit/decision-rules.md"))
+SECTORS_PATH = os.path.expanduser("~/.ark-toolkit/agent/sectors.json")
 
 
 # ---------------------------------------------------------------- 決策準則
@@ -133,14 +135,89 @@ def build_discipline(posture, holdings, layout):
     }
 
 
-def news_scope_codes(holdings, layout, benchmark=BENCHMARK):
-    """資訊邊界的機器可查證清單：持倉 ∪ 布局自選 ∪ 基準。
+# ---------------------------------------------------------------- 個股桶候選池
+
+def merge_sectors(known, *zone_maps):
+    """代號 → 產業別，累積不清除：持股一旦離開分區清單，當天就讀不到它的產業別，
+    而產業上限仍要算得出來。"""
+    out = dict(known or {})
+    for zm in zone_maps:
+        for code, row in (zm or {}).items():
+            if row.get("sector"):
+                out[code] = row["sector"]
+    return out
+
+
+def build_industry(value_rows, heating_rows, known_sectors, source, error=None):
+    """個股桶候選池：產業價值區全部標的；同時掛升溫者標 heating（決策層排除）。
+
+    API 失敗時候選為空（當天不開新倉），已知產業別照樣帶出（減碼與停損仍要用）。
+
+    `value_codes`／`heating_codes` 是兩份名單的完整代號，供持股的燈號判定
+    （risk.lamp_state）：讀不到是 None（未知），讀到但沒有才是 []——缺值
+    不等於無燈號。
+    """
+    def codes(rows):
+        return None if rows is None or error is not None else sorted(rows)
+    value_codes, heating_codes = codes(value_rows), codes(heating_rows)
+    value_rows = value_rows or {}
+    heating_rows = heating_rows or {}
+    candidates = {code: {**row, "heating": code in heating_rows}
+                  for code, row in value_rows.items()}
+    return {
+        "source": source,
+        "candidates": candidates,
+        "value_codes": value_codes,
+        "heating_codes": heating_codes,
+        "sectors": merge_sectors(known_sectors, value_rows, heating_rows),
+        "error": error,
+    }
+
+
+def market_open(date, benchmark_bars, benchmark_quote):
+    """`date` 是否有開盤：基準當日有日K，或快照時間戳是當日。
+
+    國定假日的快照與日K都停在前一個交易日——不擋的話決策層會拿舊行情做
+    今天的決策。比維護一份會過期的假日表可靠（settle 也用同一個判法）。
+    """
+    if any(b.get("date") == date for b in benchmark_bars or ()):
+        return True
+    return str((benchmark_quote or {}).get("ts", "")).startswith(date)
+
+
+def check_market_open(date):
+    """連券商查基準的當日日K與快照，交給 market_open 判定。"""
+    with market.session() as api:
+        contract = api.Contracts.Stocks.get(BENCHMARK)
+        quote = (market.quotes_from_snapshots(api.snapshots([contract])).get(BENCHMARK)
+                 if contract else None)
+        bars = market.fetch_daily(api, BENCHMARK, date, date)
+    return market_open(date, bars, quote)
+
+
+def load_sectors(path=SECTORS_PATH):
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def save_sectors(sectors, path=SECTORS_PATH):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(sectors, fh, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def news_scope_codes(holdings, layout, benchmark=BENCHMARK, industry=None):
+    """資訊邊界的機器可查證清單：持倉 ∪ 布局自選 ∪ 個股桶候選 ∪ 基準。
 
     Agent 只可就這份清單內的標的與其產業做新聞搜尋（實驗協定的半開放邊界）。
     """
     codes = set(holdings)
     if layout:
         codes |= set(layout.rows)
+    if industry:
+        codes |= set(industry.get("candidates", {}))
     codes.add(benchmark)
     return sorted(codes)
 
@@ -204,7 +281,7 @@ def serialize_layout(view):
 
 def build_packet(date, generated_at, holdings, declared, posture, layout,
                  positions, balance, settlements, quotes, recent_daily, sync_ok, diff,
-                 rules=None):
+                 rules=None, industry=None):
     """組裝決策包（全注入，不碰 AX 與 API，任何平台可測）。
 
     `rules` 一併進 hash：journal 每筆決策都綁 packet_hash，等於鎖住「當天用的是
@@ -233,9 +310,10 @@ def build_packet(date, generated_at, holdings, declared, posture, layout,
             "note": ("quotes 為 generated_at 當下的快照——盤中執行時是即時價，"
                      "非交易時段則是最近一次收盤"),
         },
+        "industry": industry or build_industry(None, None, {}, None),
         "discipline": build_discipline(posture, holdings, layout),
         "news_scope": {
-            "codes": news_scope_codes(holdings, layout),
+            "codes": news_scope_codes(holdings, layout, industry=industry),
             "note": "僅可就以上標的與其產業做新聞搜尋，不可掃全市場",
         },
         "rules": rules or {"source": None, "text": "", "ids": []},
@@ -301,6 +379,11 @@ def main():
     if dt.date.fromisoformat(date).weekday() >= 5 and not args.force:
         print(f"⚠️  {date} 是週末非交易日，不產生決策包（--force 可強制）")
         return 2
+    # 國定假日：在碰 App 之前先問行情。查不到（網路、登入）就讓它報錯失敗——
+    # 不確定有沒有開盤時，寧可今天不交易也不拿舊行情做決策。
+    if not args.force and not check_market_open(date):
+        print(f"⚠️  {date} 休市（基準 {BENCHMARK} 無當日行情），不產生決策包（--force 可強制）")
+        return MARKET_CLOSED_EXIT
 
     ark.check_platform(tool="ark-agent")
     import ax
@@ -337,6 +420,26 @@ def main():
     layout = ark.read_layout(ax, pid)
     print(f"  「{layout.watchlist}」{len(layout.rows)} 檔", flush=True)
 
+    # 個股桶候選池：走唯讀 API（重用 App 的登入），不碰 AX。失敗不擋交易——
+    # 當天個股桶只做減碼與停損，不開新倉，決策層從 industry.error 看得到原因。
+    # 候選池是可選來源，任何失敗都降級為 industry.error：catch-all 是刻意的，
+    # 因為 arkapi.session() 內部直接查 Cache.db 拷貝與讀 plist，除了
+    # ArkApiError/OSError/ValueError 之外還可能冒出 sqlite3.Error（DB 鎖住／
+    # schema 不合）或 xml.parsers.expat.ExpatError（plist 寫到一半），
+    # 這些都不該讓整支決策包中斷。
+    import arkapi
+    known = load_sectors()
+    try:
+        sess = arkapi.session()
+        industry = build_industry(arkapi.zone(sess, arkapi.INDUSTRY_VALUE),
+                                  arkapi.zone(sess, arkapi.INDUSTRY_HEATING),
+                                  known, source=f"api/st/{arkapi.INDUSTRY_VALUE}")
+        print(f"  產業價值區 {len(industry['candidates'])} 檔", flush=True)
+    except Exception as e:
+        industry = build_industry(None, None, known, source=None, error=str(e))
+        print(f"  ⚠️ 產業價值區讀取失敗，今日個股桶不開新倉：{e}", flush=True)
+    save_sectors(industry["sectors"])
+
     basis = source.cost_basis(source.load_config())   # 對帳口徑跟著 ARK 同步時用的走
     with market.session() as api:
         positions = broker_positions(api, basis)
@@ -357,7 +460,7 @@ def main():
         settlements = {"today": float(s.t_money), "t1": float(s.t1_money),
                        "t2": float(s.t2_money)}
 
-        codes = news_scope_codes(holdings, layout)
+        codes = news_scope_codes(holdings, layout, industry=industry)
         contracts = [c for c in (api.Contracts.Stocks.get(code) for code in codes) if c]
         quotes = market.quotes_from_snapshots(api.snapshots(contracts)) if contracts else {}
         start = (dt.date.fromisoformat(date)
@@ -374,7 +477,7 @@ def main():
     pk = build_packet(date=date, generated_at=now, holdings=holdings, declared=declared,
                       posture=posture, layout=layout, positions=positions, balance=balance,
                       settlements=settlements, quotes=quotes, recent_daily=recent,
-                      sync_ok=sync_ok, diff=diff, rules=rules)
+                      sync_ok=sync_ok, diff=diff, rules=rules, industry=industry)
     path = save_packet(pk)
 
     print(f"\n✅ 決策包已存至 {path}")

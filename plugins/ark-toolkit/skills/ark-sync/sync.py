@@ -174,18 +174,46 @@ def page_edit_list(ax, pid, action, timeout=2.0):
     return True
 
 
+# 視窗底部這段淨空內的按鈕 AXPress 會落空。2026-10-05 實測（視窗 y259 高 545，
+# 底邊 804）：按鈕底邊 754（離底 50）連續失敗，tab bar 按鈕要到 765 才開始——
+# 被吃掉的範圍比 tab 按鈕本身高；捲到底邊 617（離底 187）一次成功。
+BOTTOM_CLEARANCE = 80.0
+
+
+def row_near_bottom(btn_top, btn_height, win_top, win_height, clearance=BOTTOM_CLEARANCE):
+    """編輯鈕是否貼著視窗底部（tab bar）——貼著就要再捲一頁才按得到。"""
+    return btn_top + btn_height > win_top + win_height - clearance
+
+
+def _near_bottom(ax, pid, code):
+    rows = visible_rows(ax, pid)
+    btn = find_row_button(ax, rows[code][0]) if code in rows else None
+    if btn is None:
+        return False
+    w = ax.window(pid)
+    bp, bs, wp, ws = ax.point(btn), ax.size(btn), ax.point(w), ax.size(w)
+    if None in (bp, bs, wp, ws):
+        return False                # 量不到位置就照舊直接按
+    return row_near_bottom(bp[1], bs[1], wp[1], ws[1])
+
+
 def scroll_to_row(ax, pid, code, max_pages=30):
-    """把目標列捲進畫面，找到回傳 True。
+    """把目標列捲進畫面且離開底部 tab bar，找到回傳 True。
 
     離屏的列根本不在 AX tree 裡，所以無法對目標自己做 AXScrollToVisible——
     只能一頁一頁翻，每翻一頁重看畫面上有誰。先往上翻到頂再往下找，
     否則從中段開始會漏掉上方的列。
+    找到的列若貼著底部，AX tree 裡有它但 AXPress 會落空，再往下翻一頁——
+    翻頁自帶重疊，原本最底的列會留在畫面上。
     """
     for action in ("AXScrollUpByPage", "AXScrollDownByPage"):
         previous = None
         for _ in range(max_pages):
             current = tuple(sorted(visible_rows(ax, pid)))
             if code in current:
+                if _near_bottom(ax, pid, code):
+                    page_edit_list(ax, pid, "AXScrollDownByPage")
+                    return code in visible_rows(ax, pid)
                 return True
             if current == previous:
                 break               # 這個方向已到底，換方向
@@ -203,10 +231,13 @@ def posture_cash(balance, settlements, external_cash):
     未交割款要加減（當日買了 1000 先扣 1000、賣得 1 萬先加 1 萬），帳戶外的
     現金由 `external_cash` 帶入——那部分系統看不到，只能由設定給。
 
+    **今日交割款（today）不加**：它在交割日當天已進了券商餘額，再加一次就是同一筆
+    錢算兩次（口徑同 ark-agent `equity.tradable_cash`）。
+
     ARK 的欄位吃整數，且負數收不了，所以取整並夾在 0 以上。
     """
-    total = (balance + settlements.get("today", 0.0) + settlements.get("t1", 0.0)
-             + settlements.get("t2", 0.0) + external_cash)
+    total = (balance + settlements.get("t1", 0.0) + settlements.get("t2", 0.0)
+             + external_cash)
     return float(max(0, round(total)))
 
 
@@ -250,12 +281,11 @@ def _verify_and_save(ax, pid, qty, price, popup_label):
 
 
 def update_holding(ax, pid, code, qty, price):
+    # 看得到也要走 scroll_to_row：貼著底部 tab bar 的列按了會落空（2026-10-05）
+    if not scroll_to_row(ax, pid, code):
+        print(f"    ✗ {code} 捲遍整份列表仍找不到")
+        return False
     rows = visible_rows(ax, pid)
-    if code not in rows:
-        if not scroll_to_row(ax, pid, code):
-            print(f"    ✗ {code} 捲遍整份列表仍找不到")
-            return False
-        rows = visible_rows(ax, pid)
     btn = find_row_button(ax, rows[code][0])
     if btn is None:
         print(f"    ✗ {code} 找不到編輯入口")
@@ -513,7 +543,7 @@ def sync_cash(ax, pid, cfg):
     external = float(cfg.get("external_cash", 0.0))
     target = posture_cash(balance, settlements, external)
     print(f"\n同步運算頁現金欄 → {target:,.0f}"
-          f"（券商 {balance:,.0f}＋未交割 {sum(settlements.values()):,.0f}"
+          f"（券商 {balance:,.0f}＋未交割 {settlements['t1'] + settlements['t2']:,.0f}"
           f"＋帳戶外 {external:,.0f}）")
     if ark.write_posture_cash(ax, pid, target):
         print("  ✅ 已寫入")

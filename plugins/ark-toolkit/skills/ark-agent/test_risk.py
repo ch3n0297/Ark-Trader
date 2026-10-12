@@ -1,8 +1,11 @@
 """風控層純邏輯測試（不需要 ARK 或 Shioaji，任何平台可跑）"""
+import json
+import os
 import tempfile
 import unittest
 
 import equity
+import gates
 import risk
 import tracks
 
@@ -26,7 +29,7 @@ ASSIGNED = {"2330": tracks.SATELLITE, "2308": tracks.INHERITED}
 
 
 def make_packet(suggested_ratio=66.5, stock_value=196349.0, cash=14673.0,
-                adjust_amount=45882.0, sync_ok=True, positions=None):
+                adjust_amount=45882.0, sync_ok=True, positions=None, industry=None):
     return {
         "schema": 1, "date": "2026-08-11", "hash": "sha256:x",
         "ark": {
@@ -46,6 +49,7 @@ def make_packet(suggested_ratio=66.5, stock_value=196349.0, cash=14673.0,
                        "adjust_amount": adjust_amount, "sellable": [], "sell_priority": [],
                        "buy_candidates": []},
         "news_scope": {"codes": []},
+        "industry": industry or {"source": None, "candidates": {}, "sectors": {}, "error": None},
     }
 
 
@@ -156,6 +160,48 @@ class TestStopLossCandidates(unittest.TestCase):
         """現價拉高到凍結門檻之上，才真的走到除法那一行"""
         pos = {"2330": P(20, 0.0, 200.0, 2000.0)}
         self.assertEqual(self.candidates(pos), [])
+
+
+class TestSatelliteQuota(unittest.TestCase):
+    def test_配額為投入金額的一半(self):
+        # 總資源 200,000 × 建議 70% × 0.5 = 70,000
+        self.assertAlmostEqual(risk.satellite_quota(200000.0, 70.0, 0.5, 0.25), 70000.0)
+
+    def test_讀不到建議比例時退用固定比例(self):
+        self.assertAlmostEqual(risk.satellite_quota(200000.0, None, 0.5, 0.25), 50000.0)
+
+
+class TestTrimCandidates(unittest.TestCase):
+    def test_超過上限加緩衝才列(self):
+        resolved = {"2308": {"track": tracks.SATELLITE, "value": 55000.0, "pnl": 400.0},
+                    "2330": {"track": tracks.SATELLITE, "value": 28000.0, "pnl": 3000.0},
+                    "0050": {"track": tracks.CORE, "value": 90000.0, "pnl": 0.0}}
+        out = risk.trim_candidates(resolved, total=200000.0, name_cap=0.12, buffer=0.03)
+        self.assertEqual([c["code"] for c in out], ["2308"])          # 27.5% > 15%；2330 14% 不列
+        self.assertAlmostEqual(out[0]["target_value"], 24000.0)
+        self.assertAlmostEqual(out[0]["excess_value"], 31000.0)
+
+    def test_主軌不列(self):
+        resolved = {"0050": {"track": tracks.CORE, "value": 90000.0, "pnl": 0.0}}
+        self.assertEqual(risk.trim_candidates(resolved, 100000.0, 0.12, 0.03), [])
+
+
+class TestSatelliteAllowlist(unittest.TestCase):
+    def test_候選聯集持有與指定(self):
+        resolved = {"2330": {"track": tracks.SATELLITE}, "0050": {"track": tracks.CORE}}
+        out = risk.satellite_allowlist({"2308": tracks.SATELLITE}, resolved,
+                                       {"6274": {}, "2330": {}})
+        self.assertEqual(out, ["2308", "2330", "6274"])
+
+
+class TestSectorExposure(unittest.TestCase):
+    def test_依產業加總衛星軌市值_缺產業別各自成一類(self):
+        resolved = {"2330": {"track": tracks.SATELLITE, "value": 44000.0},
+                    "2308": {"track": tracks.SATELLITE, "value": 55000.0},
+                    "6274": {"track": tracks.SATELLITE, "value": 10000.0},
+                    "0050": {"track": tracks.CORE, "value": 9000.0}}
+        out = risk.sector_exposure(resolved, {"2330": "半導體", "6274": "PCB-製造"})
+        self.assertEqual(out, {"半導體": 44000.0, "PCB-製造": 10000.0, "2308": 55000.0})
 
 
 class TestConsecutiveStops(unittest.TestCase):
@@ -271,6 +317,15 @@ class TestOrderCaps(unittest.TestCase):
         v = self.caps([{"action": "sell", "code": "0050", "qty": 10}])    # 1,000
         self.assertTrue(any("最小可交易" in x for x in v))
 
+    def test_凍結軌清倉不受最小可交易金額限制(self):
+        """凍結軌就是低於門檻的部位，清倉必然低於門檻；journal 已驗過是整筆清掉。"""
+        v = self.caps([{"action": "sell", "code": "0050", "qty": 10, "track": "frozen"}])
+        self.assertEqual(v, [])
+
+    def test_凍結軌標記不放寬買單(self):
+        v = self.caps([{"action": "buy", "code": "0050", "qty": 10, "track": "frozen"}])
+        self.assertTrue(any("最小可交易" in x for x in v))
+
     def test_無報價時以限價中點估值(self):
         v = self.caps([{"action": "buy", "code": "9999", "qty": 10,
                         "limit_low": 2400.0, "limit_high": 2600.0}])      # 25,000
@@ -344,8 +399,8 @@ class TestBuildEnvelope(unittest.TestCase):
         self.assertTrue(any("對帳" in b for b in e["blocks"]))
 
     def test_衛星軌白名單來自指定而非持倉(self):
-        """開新衛星標的必須有人手動寫進 tracks.json——程式不自己擴充白名單。
-        持倉清單做不到這件事：還沒買的標的不在持倉裡。"""
+        """白名單＝ARK 候選 ∪ 目前持有的衛星軌 ∪ tracks.json 指定：持有與指定一定要在，
+        減碼與停損不能被白名單擋；這裡沒有候選池，00631L 純靠手動指定才出現在白名單。"""
         e = risk.build_envelope(
             packet=make_packet(), assigned={**ASSIGNED, "00631L": tracks.SATELLITE},
             equity_points=[equity.make_point("2026-08-10", 196349.0, 14673.0, 47600.0)],
@@ -406,6 +461,39 @@ class TestBuildEnvelope(unittest.TestCase):
             config=risk.DEFAULTS)
         self.assertEqual(e["core"]["max_names"], 3)
 
+    def test_衛星軌配額與閘門進envelope(self):
+        pk = make_packet(suggested_ratio=70.0, stock_value=180000.0, cash=20000.0,
+                         industry={"source": "api/st/10",
+                                   "candidates": {"6274": {"sector": "PCB-製造", "heating": False}},
+                                   "sectors": {"2330": "半導體", "6274": "PCB-製造"},
+                                   "error": None})
+        e = risk.build_envelope(
+            packet=pk, assigned=ASSIGNED, equity_points=[], satellite_exits=[],
+            calendar=CALENDAR, today="2026-08-11", effective_max_names=2,
+            max_names_history=[2], config=risk.DEFAULTS,
+            gates={**gates.DEFAULTS, "history": [1]})
+        s = e["tracks"][tracks.SATELLITE]
+        self.assertAlmostEqual(s["quota"], 200000.0 * 0.70 * 0.5)
+        self.assertEqual(s["allowlist"], ["2330", "6274"])
+        sat = e["satellite"]
+        # envelope 只留五個閘門值本身——不能把 gates.json 的 history 一起存進每天的
+        # envelope，那會讓存檔越滾越大
+        self.assertNotIn("history", sat["gates"])
+        self.assertEqual(sat["gates"], gates.DEFAULTS)
+        self.assertAlmostEqual(sat["name_cap_value"], 24000.0)
+        self.assertAlmostEqual(sat["sector_cap_value"], 50000.0)
+        self.assertEqual(sat["sectors"]["2330"], "半導體")
+        self.assertEqual(sat["sector_exposure"], {"半導體": 47600.0})
+        self.assertEqual(sat["candidates_source"], "api/st/10")
+        self.assertEqual(sat["stop_loss"], -0.12)
+        self.assertEqual([c["code"] for c in sat["trim_candidates"]], ["2330"])   # 47,600 / 200,000 = 23.8%
+
+    def test_沒有gates時沿用舊配額與停損(self):
+        e = self.env()
+        s = e["tracks"][tracks.SATELLITE]
+        self.assertAlmostEqual(s["quota"], risk.total_resource(make_packet()) * 0.25)
+        self.assertEqual(e["satellite"]["stop_loss"], risk.DEFAULTS["satellite_stop_loss"])
+
 
 class TestFullyBlocked(unittest.TestCase):
     """排程要能分辨「今天不該交易」與「程式壞了」——前者離開碼 3、後者 2。
@@ -450,5 +538,188 @@ class TestEnvelopeHistory(unittest.TestCase):
         self.assertEqual(risk.max_names_history(self.dir), ([2], 1))
 
 
+class TestGatesFallback(unittest.TestCase):
+    """gates.json 壞掉時風控層要退回預設並留下警告，而不是整條決策軌炸掉。"""
+
+    def write(self, data):
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "gates.json")
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        return p
+
+    def test_區間外的閘門檔退回預設並帶警告(self):
+        g, warning = risk.load_gates_or_defaults(self.write({"name_cap": 0.30}))
+        self.assertEqual(g, gates.DEFAULTS)
+        self.assertIn("gates.json 無效", warning)
+        self.assertIn("name_cap", warning)
+
+    def test_合法的閘門檔照讀且無警告(self):
+        g, warning = risk.load_gates_or_defaults(self.write({"name_cap": 0.10}))
+        self.assertIsNone(warning)
+        self.assertEqual(g["name_cap"], 0.10)
+        self.assertEqual(g["sector_cap"], gates.DEFAULTS["sector_cap"])
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------- 個股桶燈號（使用者 2026-10-08 明示）
+
+LAMP_INDUSTRY = {"source": "api/st/10", "candidates": {"2330": {"heating": False}},
+                 "value_codes": ["2330"], "heating_codes": ["6274"],
+                 "sectors": {}, "error": None}
+
+
+def lamp_row(tiers, suggest_qty=0):
+    return {"tiers": list(tiers), "suggest_qty": suggest_qty}
+
+
+class TestLampState(unittest.TestCase):
+    """確認無燈號＝持股列有讀到且無位階、價值區與升溫區名單都完整且都不含它。
+    任何一個來源缺失或讀取失敗都是未知——缺值不等於無燈號。"""
+
+    def state(self, code, holdings, industry=LAMP_INDUSTRY):
+        return risk.lamp_state(code, holdings, industry)
+
+    def test_兩來源皆無燈號_確認無燈號(self):
+        s = self.state("2383", {"2383": lamp_row([])})
+        self.assertEqual(s["state"], risk.LAMP_NONE)
+        self.assertIs(s["value"], False)
+        self.assertIs(s["heating"], False)
+
+    def test_只有價值(self):
+        s = self.state("2330", {"2330": lamp_row(["價值"])})
+        self.assertEqual(s["state"], risk.LAMP_VALUE_ONLY)
+
+    def test_價值加升溫(self):
+        ind = {**LAMP_INDUSTRY, "heating_codes": ["2330"]}
+        s = self.state("2330", {"2330": lamp_row(["價值", "升溫"])}, ind)
+        self.assertEqual(s["state"], risk.LAMP_VALUE_HEATING)
+
+    def test_只有升溫(self):
+        s = self.state("6274", {"6274": lamp_row(["升溫"])})
+        self.assertEqual(s["state"], risk.LAMP_HEATING_ONLY)
+
+    def test_來源矛盾時以亮燈的一方為準_不判無燈號(self):
+        s = self.state("2330", {"2330": lamp_row([])})        # 持股列空、名單卻有
+        self.assertEqual(s["state"], risk.LAMP_VALUE_ONLY)
+
+    def test_升溫名單沒保存_未知(self):
+        ind = {k: v for k, v in LAMP_INDUSTRY.items() if k != "heating_codes"}
+        s = self.state("2383", {"2383": lamp_row([])}, ind)
+        self.assertEqual(s["state"], risk.LAMP_UNKNOWN)
+
+    def test_產業名單讀取失敗_未知(self):
+        ind = {"source": None, "candidates": {}, "value_codes": None,
+               "heating_codes": None, "sectors": {}, "error": "連不上"}
+        s = self.state("2383", {"2383": lamp_row([])}, ind)
+        self.assertEqual(s["state"], risk.LAMP_UNKNOWN)
+
+    def test_持股列沒讀到_未知(self):
+        self.assertEqual(self.state("2383", {})["state"], risk.LAMP_UNKNOWN)
+
+    def test_位階與建議調節整組缺失_未知(self):
+        s = self.state("2383", {"2383": lamp_row([], suggest_qty=None)})
+        self.assertEqual(s["state"], risk.LAMP_UNKNOWN)
+
+    def test_10月8日川湖的舊決策包_升溫名單未存_未知(self):
+        old = {"source": "api/st/10", "candidates": {}, "sectors": {}, "error": None}
+        s = self.state("2059", {"2059": lamp_row([])}, old)
+        self.assertEqual(s["state"], risk.LAMP_UNKNOWN)
+
+
+NONE_INDUSTRY = {**LAMP_INDUSTRY, "candidates": {}, "value_codes": []}
+
+
+class TestLampExitsInEnvelope(unittest.TestCase):
+    """確認無燈號的個股桶部位，在使用者設定的範圍內列入必賣；未知不得誤觸發。"""
+
+    def env(self, holdings, industry, scope="all"):
+        p = make_packet(industry=industry)
+        p["ark"]["holdings"] = holdings
+        p["generated_at"] = "2026-08-11T10:01:00"
+        return TestBuildEnvelope.env(self, packet=p, config={"lamp_exit_scope": scope})
+
+    def test_預設範圍關閉_確認無燈號也不強制(self):
+        e = self.env({"2330": lamp_row([])}, NONE_INDUSTRY, scope=risk.DEFAULTS["lamp_exit_scope"])
+        self.assertEqual(e["satellite"]["lamp_exits"], [])
+        self.assertEqual(e["satellite"]["lamps"]["2330"]["state"], risk.LAMP_NONE)   # 燈號仍算出
+
+    def test_範圍限定代號_只列清單內(self):
+        e = self.env({"2330": lamp_row([])}, NONE_INDUSTRY, scope=["2059"])
+        self.assertEqual(e["satellite"]["lamp_exits"], [])
+        e = self.env({"2330": lamp_row([])}, NONE_INDUSTRY, scope=["2330"])
+        self.assertEqual(e["satellite"]["lamp_exits"], [{"code": "2330", "qty": 20}])
+
+    def test_確認無燈號_列入必賣且整筆(self):
+        e = self.env({"2330": lamp_row([])}, NONE_INDUSTRY)
+        self.assertEqual(e["satellite"]["lamp_exits"], [{"code": "2330", "qty": 20}])
+        self.assertEqual(e["satellite"]["lamps"]["2330"]["state"], risk.LAMP_NONE)
+        self.assertEqual(e["satellite"]["lamps_as_of"], "2026-08-11T10:01:00")
+
+    def test_未知不列入必賣(self):
+        e = self.env({"2330": lamp_row([])},
+                     {"source": None, "candidates": {}, "value_codes": None,
+                      "heating_codes": None, "sectors": {}, "error": "連不上"})
+        self.assertEqual(e["satellite"]["lamp_exits"], [])
+        self.assertEqual(e["satellite"]["lamps"]["2330"]["state"], risk.LAMP_UNKNOWN)
+
+    def test_只有價值不列入必賣(self):
+        e = self.env({"2330": lamp_row(["價值"])}, LAMP_INDUSTRY)
+        self.assertEqual(e["satellite"]["lamp_exits"], [])
+
+    def test_非個股桶的部位不判燈號(self):
+        e = self.env({"2308": lamp_row([]), "2330": lamp_row(["價值"])}, LAMP_INDUSTRY)
+        self.assertNotIn("2308", e["satellite"]["lamps"])       # 2308 歸繼承軌
+
+
+class TestLampExitScopeFromEnv(unittest.TestCase):
+    def test_未設定或off為關閉(self):
+        self.assertEqual(risk.lamp_exit_scope_from_env({}), "off")
+        self.assertEqual(risk.lamp_exit_scope_from_env({"ARK_LAMP_EXIT": "OFF"}), "off")
+
+    def test_all為整個個股桶(self):
+        self.assertEqual(risk.lamp_exit_scope_from_env({"ARK_LAMP_EXIT": "all"}), "all")
+
+    def test_代號清單(self):
+        self.assertEqual(risk.lamp_exit_scope_from_env({"ARK_LAMP_EXIT": " 2059, 2383 "}),
+                         ["2059", "2383"])
+
+
+class TestLampStateMalformedRow(unittest.TestCase):
+    """持股列的位階欄缺失或型別不對＝沒讀到，不是空燈號。兩份名單完整且都不含它時，
+    只有 tiers=[]（真的讀到、真的沒字樣）才能當確認無燈號的證據。"""
+
+    def state(self, holding):
+        return risk.lamp_state("2383", {"2383": holding}, LAMP_INDUSTRY)["state"]
+
+    def test_tiers為空清單且名單完整_確認無燈號(self):
+        self.assertEqual(self.state({"tiers": [], "suggest_qty": 0}), risk.LAMP_NONE)
+
+    def test_tiers缺欄_未知(self):
+        self.assertEqual(self.state({"suggest_qty": 0}), risk.LAMP_UNKNOWN)
+
+    def test_tiers為None_未知(self):
+        self.assertEqual(self.state({"tiers": None, "suggest_qty": 0}), risk.LAMP_UNKNOWN)
+
+    def test_tiers型別不對_未知(self):
+        for bad in ("", "價值", {"價值": True}, 0, [None], [1]):
+            with self.subTest(tiers=bad):
+                self.assertEqual(self.state({"tiers": bad, "suggest_qty": 0}), risk.LAMP_UNKNOWN)
+
+    def test_suggest_qty型別不對_未知(self):
+        for bad in ("0", 0.5, True, [0]):
+            with self.subTest(suggest_qty=bad):
+                self.assertEqual(self.state({"tiers": [], "suggest_qty": bad}), risk.LAMP_UNKNOWN)
+
+    def test_持股列本身不是物件_未知(self):
+        for bad in (None, [], "2383"):
+            with self.subTest(holding=bad):
+                self.assertEqual(self.state(bad), risk.LAMP_UNKNOWN)
+
+    def test_名單型別不對_未知(self):
+        ind = {**LAMP_INDUSTRY, "heating_codes": "6274"}
+        s = risk.lamp_state("2383", {"2383": {"tiers": [], "suggest_qty": 0}}, ind)
+        self.assertEqual(s["state"], risk.LAMP_UNKNOWN)

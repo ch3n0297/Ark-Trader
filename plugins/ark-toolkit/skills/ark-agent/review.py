@@ -98,6 +98,13 @@ def build_context(packet, envelope):
         "sellable": disc.get("sellable", []),
         "breaker": (envelope or {}).get("breaker", {}).get("level"),
         "candidates": candidates,
+        "satellite": {
+            "gates": (envelope or {}).get("satellite", {}).get("gates"),
+            "trim_candidates": [c["code"] for c in
+                                (envelope or {}).get("satellite", {}).get("trim_candidates", [])],
+            "candidates_n": len(packet.get("industry", {}).get("candidates", {})),
+            "candidates_source": (envelope or {}).get("satellite", {}).get("candidates_source"),
+        },
     }
 
 
@@ -165,27 +172,43 @@ def rule_performance(cases, horizon):
 
     沒有這條歸因鏈，「依損益調整準則」就只是換一種方式憑感覺：改了規則卻
     無從得知改對沒有。尚未到期的單不計入分母，否則新準則會被當成 0% 報酬。
+
+    委託帶自己的 `rules_applied` 時只歸給那幾條；沒有這個欄位（舊紀錄）才退回
+    決策層的清單——那樣當天每筆單都記到當天每條準則頭上，各條數字會一模一樣。
+    超額另外統計：報酬為正但落後基準的準則，不算被損益支持。
     """
     buckets = {}
+
+    def slot(rule_id):
+        return buckets.setdefault(rule_id, {"days": set(), "returns": [], "excess": []})
+
     for case in cases:
-        for rule_id in case.get("rules_applied") or []:
-            slot = buckets.setdefault(rule_id, {"n_decisions": 0, "returns": []})
-            slot["n_decisions"] += 1
-            for o in case.get("orders", []):
-                h = (o.get("horizons") or {}).get(horizon) or {}
+        day_rules = case.get("rules_applied") or []
+        for rule_id in day_rules:
+            slot(rule_id)["days"].add(case["date"])
+        for o in case.get("orders", []):
+            h = (o.get("horizons") or {}).get(horizon) or {}
+            for rule_id in o["rules_applied"] if "rules_applied" in o else day_rules:
+                s = slot(rule_id)
+                s["days"].add(case["date"])
                 if h.get("return_adj") is not None:
-                    slot["returns"].append(h["return_adj"])
-    out = {}
-    for rule_id, slot in buckets.items():
-        rets = slot["returns"]
-        out[rule_id] = {
-            "n_decisions": slot["n_decisions"],
-            "n_evaluated": len(rets),
-            "avg_return": round(sum(rets) / len(rets), 6) if rets else None,
-            "win_rate": (round(sum(1 for r in rets if r > 0) / len(rets), 4)
-                         if rets else None),
-        }
-    return out
+                    s["returns"].append(h["return_adj"])
+                    if h.get("excess") is not None:
+                        s["excess"].append(h["excess"])
+
+    def mean(xs):
+        return round(sum(xs) / len(xs), 6) if xs else None
+
+    def share_positive(xs):
+        return round(sum(1 for x in xs if x > 0) / len(xs), 4) if xs else None
+
+    return {rule_id: {"n_decisions": len(s["days"]),
+                      "n_evaluated": len(s["returns"]),
+                      "avg_return": mean(s["returns"]),
+                      "win_rate": share_positive(s["returns"]),
+                      "avg_excess": mean(s["excess"]),
+                      "excess_win_rate": share_positive(s["excess"])}
+            for rule_id, s in buckets.items()}
 
 
 # ---------------------------------------------------------------- 輸出
@@ -275,6 +298,8 @@ def render(cases, perf, horizon):
                        f"　[{o.get('track', 'core')}]"
                        f"　限價 {o.get('limit_low')}~{o.get('limit_high')}")
             out.append(f"    依據　{basis.get('signal')}={basis.get('value')}")
+            if o.get("rules_applied"):
+                out.append(f"    準則　{'、'.join(o['rules_applied'])}")
             out.append(f"    理由　{o.get('reason', '')}")
             out.append(f"    結果　{exec_label(o.get('exec_status'), o.get('exec_price'))}"
                        f"　{_fmt_horizons(o.get('horizons') or {})}")
@@ -286,19 +311,72 @@ def render(cases, perf, horizon):
 
     if perf:
         out.append(f"\n\n## 準則損益歸因（T+{horizon}）")
-        out.append("  準則      採用天數  已評筆數   勝率     平均報酬")
+        out.append("  準則      採用天數  已評筆數   勝率     平均報酬     平均超額  超額為正")
+
+        def pct(v, spec):
+            return format(v, spec) if v is not None else "-"
+
         for rule_id, p in sorted(perf.items()):
-            avg = f"{p['avg_return']:+.2%}" if p["avg_return"] is not None else "-"
-            win = f"{p['win_rate']:.0%}" if p["win_rate"] is not None else "-"
             out.append(f"  {rule_id:<10}{p['n_decisions']:>6}{p['n_evaluated']:>10}"
-                       f"{win:>8}{avg:>12}")
+                       f"{pct(p['win_rate'], '.0%'):>8}{pct(p['avg_return'], '+.2%'):>12}"
+                       f"{pct(p['avg_excess'], '+.2%'):>12}"
+                       f"{pct(p['excess_win_rate'], '.0%'):>10}")
     else:
         out.append("\n\n（尚無決策標記採用準則——準則損益歸因需要 decision "
                    "帶 rules_applied 欄位）")
     return "\n".join(out)
 
 
+def satellite_evaluated_line(report):
+    """報告第一行：個股桶 T+5 已評筆數——複盤層據此決定閘門調不調。
+
+    horizons 的鍵經過 JSON 往返會變字串，兩種都要讀得到。
+    """
+    horizons = (report.get("satellite") or {}).get("horizons") or {}
+    bucket = horizons.get(5) or horizons.get("5") or {}
+    return f"個股桶 T+5 已評 {bucket.get('evaluated', 0)} 筆（少於 5 筆時閘門維持不調）"
+
+
 # ---------------------------------------------------------------- CLI
+
+FETCH_MAX_FAILURES = 3     # 連續失敗幾檔就停手（Shioaji kbars 單次逾時 30 秒）
+
+
+def fetch_prices(api, codes, start, end, fetch=None, load_cache=None,
+                 max_failures=FETCH_MAX_FAILURES):
+    """逐檔抓日K；失敗改用本地快取（篩在區間內）並記進缺口，連續失敗達上限後
+    剩下的直接用快取、不再嘗試。回傳 (prices, gaps)。
+
+    2026-10-02 的複盤因單一 kbars 逾時整支中斷。有界降級讓複盤照樣產出，
+    但缺口要寫進報告——快取可能缺最新日，不能當成完整績效。
+    """
+    fetch = fetch or market.fetch_daily
+    load_cache = load_cache or market.load_cache
+    prices, gaps, streak = {}, {}, 0
+    for code in codes:
+        if streak >= max_failures:
+            gaps[code] = f"未嘗試（前面已連續失敗 {streak} 檔）"
+        else:
+            try:
+                prices[code] = fetch(api, code, start, end)
+                streak = 0
+                continue
+            except Exception as e:      # 任何行情錯誤都降級，不讓整份複盤中斷
+                streak += 1
+                gaps[code] = f"抓取失敗：{e}"
+        prices[code] = [b for b in load_cache(code) if start <= b["date"] <= end]
+    return prices, gaps
+
+
+def price_gaps_line(gaps):
+    """報告開頭的缺口說明；沒有缺口回空字串。"""
+    if not gaps:
+        return ""
+    detail = "；".join(f"{c} {why}" for c, why in sorted(gaps.items()))
+    return (f"⚠️ 行情不完整：{len(gaps)} 檔改用本地快取（{detail}）。"
+            "這些標的的前瞻報酬可能缺最新交易日；未到期者照列 pending，"
+            "不可當成完整績效，也不足以改變準則狀態。")
+
 
 def main():
     ap = argparse.ArgumentParser(description="決策複盤：組出逐筆案例供檢討")
@@ -326,12 +404,17 @@ def main():
                     for o in e.get("orders", [])} | {packet_mod.BENCHMARK})
     start = (dt.date.fromisoformat(since) - dt.timedelta(days=7)).isoformat()
     today = dt.date.today().isoformat()
+    gaps = {}
     if args.offline:
         prices = {c: [b for b in market.load_cache(c) if start <= b["date"] <= today]
                   for c in codes}
     else:
-        with market.session() as api:
-            prices = {c: market.fetch_daily(api, c, start, today) for c in codes}
+        try:
+            with market.session() as api:
+                prices, gaps = fetch_prices(api, codes, start, today)
+        except Exception as e:          # 連登入都失敗：全部改用快取並標記
+            prices, gaps = fetch_prices(None, codes, start, today, max_failures=0)
+            gaps = {c: f"券商連線失敗：{e}" for c in gaps}
 
     report = evaluate.evaluate_all(entries, packets, prices,
                                    prices.get(packet_mod.BENCHMARK, []),
@@ -341,9 +424,12 @@ def main():
     perf = rule_performance(cases, args.horizon)
     if args.json:
         text = json.dumps({"since": since, "until": until, "cases": cases,
-                           "rule_performance": perf}, ensure_ascii=False, indent=2)
+                           "rule_performance": perf, "price_gaps": gaps},
+                          ensure_ascii=False, indent=2)
     else:
-        text = (f"複盤區間 {since} ～ {until}　案例 {len(cases)} 則\n"
+        text = ((price_gaps_line(gaps) + "\n\n" if gaps else "")
+                + satellite_evaluated_line(report) + "\n\n"
+                + f"複盤區間 {since} ～ {until}　案例 {len(cases)} 則\n"
                 + render(cases, perf, args.horizon))
     if args.out:
         with open(args.out, "w", encoding="utf-8") as fh:

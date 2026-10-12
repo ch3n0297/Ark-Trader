@@ -194,7 +194,7 @@ def attr(el, name):
     return val if err == 0 else None
 
 
-def window(pid):
+def _window_once(pid):
     app = AXUIElementCreateApplication(pid)
     wins = attr(app, "AXWindows")
     if wins:
@@ -202,10 +202,22 @@ def window(pid):
     # 失焦時 AXWindows 列舉回空（err=0）但 AXMainWindow 仍讀得到——這不是
     # App 被暫停（那會回 -25204），只是列舉被藏起來。靠這個 fallback，
     # 整條操作鏈才能在 ARK 不在前景時運作。
-    win = attr(app, "AXMainWindow")
-    if win is not None:
-        return win
-    raise ArkNotRunning("讀不到 ARK 視窗（App 可能被隱藏／最小化而暫停）")
+    return attr(app, "AXMainWindow")
+
+
+def window(pid, retry=2.0, _once=None, _sleep=time.sleep):
+    """ARK 主視窗。兩個屬性同時瞬間回空是常態（換頁、彈窗、剛被喚醒的一瞬），
+    2026-09-07～09 六次流程中斷都是它——在原語層短暫重試，所有呼叫端一起受益；
+    重試到期仍讀不到才拋 ArkNotRunning（那才是真的被隱藏／暫停）。"""
+    once = _once or _window_once
+    deadline = time.time() + retry
+    while True:
+        win = once(pid)
+        if win is not None:
+            return win
+        if time.time() >= deadline:
+            raise ArkNotRunning("讀不到 ARK 視窗（App 可能被隱藏／最小化而暫停）")
+        _sleep(0.2)
 
 
 def find(el, pred, out=None, seen=None):

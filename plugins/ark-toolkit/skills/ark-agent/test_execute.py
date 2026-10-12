@@ -4,6 +4,7 @@
 兩處出錯都不會被上游的紀律驗證攔到——journal 只看股數與代號，看不到
 最後送進 API 的那組參數。
 """
+import types
 import unittest
 
 import execute
@@ -45,6 +46,29 @@ class TestSplitShares(unittest.TestCase):
             total = sum(qty * (1000 if lot == execute.COMMON else 1)
                         for lot, qty in execute.split_shares(shares))
             self.assertEqual(total, shares)
+
+
+class TestSplitSharesAfterHours(unittest.TestCase):
+    def test_零股整筆走盤後零股(self):
+        self.assertEqual(execute.split_shares_after_hours(17), [("Odd", 17)])
+
+    def test_超過999拆成多筆且股數守恆(self):
+        legs = execute.split_shares_after_hours(1500)
+        self.assertEqual(legs, [("Odd", 999), ("Odd", 501)])
+        self.assertEqual(sum(q for _l, q in legs), 1500)
+
+    def test_零股數不產生委託(self):
+        self.assertEqual(execute.split_shares_after_hours(0), [])
+
+    def test_build_legs可切盤後零股(self):
+        limits = {"limit_up": 70.0, "limit_down": 57.0}
+        order = {"code": "0052", "action": "buy", "qty": 1200,
+                 "limit_low": 63.0, "limit_high": 64.0}
+        legs = execute.build_legs(order, limits, after_hours=True)
+        self.assertEqual([(l["order_lot"], l["quantity"], l["shares"]) for l in legs],
+                         [("Odd", 999, 999), ("Odd", 201, 201)])
+        self.assertEqual([l["order_lot"] for l in execute.build_legs(order, limits)],
+                         ["Common", "IntradayOdd"])
 
 
 class TestIsETF(unittest.TestCase):
@@ -221,6 +245,89 @@ class TestExecutionGuard(unittest.TestCase):
         """縱深防禦：journal 驗紀律、envelope 定邊界，送出前還要再擋一次"""
         v = self.guard([{"action": "buy", "code": "0050", "qty": 300}])   # 31,275
         self.assertTrue(any("單筆" in x for x in v))
+
+
+class FakeTrade:
+    def __init__(self, seqno, status):
+        self.order = types.SimpleNamespace(seqno=seqno)
+        self.status = types.SimpleNamespace(status=status)
+
+
+class FakeApi:
+    """每次 list_trades 依序吐出 timeline 的一個快照，最後一個快照重複回傳"""
+    stock_account = object()
+
+    def __init__(self, timeline):
+        self.timeline = list(timeline)
+        self.cancelled = []
+
+    def update_status(self, account):
+        pass
+
+    def list_trades(self):
+        snap = self.timeline.pop(0) if len(self.timeline) > 1 else self.timeline[0]
+        return [FakeTrade(s, st) for s, st in snap.items()]
+
+    def cancel_order(self, trade):
+        self.cancelled.append(trade.order.seqno)
+
+
+RESULTS = [{"code": "2330", "action": "sell", "seqno": "A1", "ok": True},
+           {"code": "0056", "action": "sell", "seqno": "A2", "ok": True},
+           {"code": "0050", "action": "buy", "ok": False, "error": "拒單"}]
+
+
+class TestPendingSeqnos(unittest.TestCase):
+    def test_終態的腿不算未完成(self):
+        self.assertEqual(execute.pending_seqnos(
+            RESULTS, {"A1": "OrderStatus.Filled", "A2": "OrderStatus.Cancelled"}), [])
+
+    def test_未終態與查不到狀態的腿都算未完成(self):
+        """查不到狀態保守視為未完成——寧可多等，不可漏刪"""
+        self.assertEqual(execute.pending_seqnos(
+            RESULTS, {"A1": "OrderStatus.Submitted"}), ["A1", "A2"])
+
+    def test_部分成交仍算未完成(self):
+        self.assertEqual(execute.pending_seqnos(
+            RESULTS, {"A1": "OrderStatus.PartFilled", "A2": "OrderStatus.Filled"}), ["A1"])
+
+
+class TestWaitForFills(unittest.TestCase):
+    def clock_and_sleep(self):
+        t = [0.0]
+        sleeps = []
+
+        def sleep(s):
+            sleeps.append(s)
+            t[0] += s
+        return (lambda: t[0]), sleep, sleeps
+
+    def test_全部成交就立刻回傳不睡(self):
+        api = FakeApi([{"A1": "OrderStatus.Filled", "A2": "OrderStatus.Filled"}])
+        clock, sleep, sleeps = self.clock_and_sleep()
+        statuses, cancelled = execute.wait_for_fills(api, RESULTS, 30, poll_seconds=20,
+                                                     clock=clock, sleep=sleep)
+        self.assertEqual(cancelled, [])
+        self.assertEqual(sleeps, [])
+        self.assertEqual(statuses["A1"], "Filled")
+
+    def test_未逾時前持續輪詢(self):
+        api = FakeApi([{"A1": "OrderStatus.Submitted", "A2": "OrderStatus.Submitted"},
+                       {"A1": "OrderStatus.Filled", "A2": "OrderStatus.Filled"}])
+        clock, sleep, sleeps = self.clock_and_sleep()
+        _, cancelled = execute.wait_for_fills(api, RESULTS, 30, poll_seconds=20,
+                                              clock=clock, sleep=sleep)
+        self.assertEqual(cancelled, [])
+        self.assertEqual(sleeps, [20])
+
+    def test_逾時仍未成交的腿刪單(self):
+        api = FakeApi([{"A1": "OrderStatus.Filled", "A2": "OrderStatus.Submitted"}])
+        clock, sleep, sleeps = self.clock_and_sleep()
+        _, cancelled = execute.wait_for_fills(api, RESULTS, 1, poll_seconds=20,
+                                              clock=clock, sleep=sleep)
+        self.assertEqual(cancelled, ["A2"])
+        self.assertEqual(api.cancelled, ["A2"])
+        self.assertEqual(sleeps, [20, 20, 20])
 
 
 if __name__ == "__main__":

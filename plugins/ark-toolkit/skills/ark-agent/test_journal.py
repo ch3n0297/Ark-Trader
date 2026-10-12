@@ -1,9 +1,13 @@
 """ark-agent 決策日誌純邏輯測試（不需要 Shioaji，任何平台可跑）"""
 import os
+import sys
 import tempfile
+import types
 import unittest
+from unittest import mock
 
 import journal
+import tracks
 
 PACKET = {
     "date": "2026-08-10",
@@ -117,12 +121,17 @@ ENVELOPE = {
                "daily_turnover_cap": 600000.0, "min_trade_value": 1000.0},
     "tracks": {
         "core": {"codes": ["2308"], "value": 49500.0},
-        "satellite": {"codes": ["2330"], "allowlist": ["2330", "00631L"],
+        "satellite": {"codes": ["2330"], "allowlist": ["2330", "00631L", "6274", "3374"],
                       "value": 47600.0, "quota": 52755.5, "remaining": 5155.5,
                       "halted": False},
         "inherited": {"codes": [], "value": 0.0},
         "frozen": {"codes": [], "value": 0.0},
     },
+    "satellite": {"stop_loss": -0.12, "candidates": [],
+                  "name_cap_value": 24000.0, "sector_cap_value": 50000.0,
+                  "sectors": {"2330": "半導體", "6274": "PCB-製造", "3374": "IC-封測"},
+                  "sector_exposure": {"半導體": 47600.0},
+                  "trim_candidates": []},
 }
 # 2330 虧損中（不在 sellable），且不必先調節——用來單獨檢驗軌道分流
 LOSS_PACKET = {**PACKET, "discipline": {**PACKET["discipline"],
@@ -132,6 +141,59 @@ LOSS_PACKET = {**PACKET, "discipline": {**PACKET["discipline"],
 
 def sat(order):
     return {**order, "track": "satellite"}
+
+
+def frz(order):
+    return {**order, "track": "frozen"}
+
+
+# 00911：15 股虧損中、市值低於最小金額、已不在 ARK 價值區；0053：碎片但仍掛價值
+FROZEN_PACKET = {**LOSS_PACKET,
+                 "account": {"positions": {**LOSS_PACKET["account"]["positions"],
+                                           "00911": {"qty": 15, "avg_price": 55.67},
+                                           "0053": {"qty": 2, "avg_price": 245.5}}},
+                 "ark": {"holdings": {"00911": {"tiers": []}, "0053": {"tiers": ["價值"]}}},
+                 "news_scope": {"codes": [*LOSS_PACKET["news_scope"]["codes"], "00911", "0053"]}}
+FROZEN_ENVELOPE = {**ENVELOPE, "tracks": {**ENVELOPE["tracks"],
+                                          "frozen": {"codes": ["00911", "0053"], "value": 1277.0}}}
+
+
+class TestFrozenExit(unittest.TestCase):
+    """凍結軌出場（使用者 2026-09-07 決定）：碎片只准整筆清掉，且已離開價值區。
+    這是對「獲利才賣」的明示偏離，所以條件要收得很緊。"""
+
+    def validate(self, orders):
+        return journal.validate_orders(orders, FROZEN_PACKET, FROZEN_ENVELOPE)
+
+    def test_整筆清掉已離開價值區的碎片可放行(self):
+        self.assertEqual(self.validate([frz(sell(code="00911", qty=15,
+                                                 low=51.0, high=53.0))]), [])
+
+    def test_主軌賣同一檔仍被獲利才賣擋下(self):
+        v = journal.validate_orders([sell(code="00911", qty=15, low=51.0, high=53.0)],
+                                    FROZEN_PACKET, FROZEN_ENVELOPE)
+        self.assertTrue(any("可調節" in x for x in v))
+
+    def test_只賣一部分被拒(self):
+        v = self.validate([frz(sell(code="00911", qty=10, low=51.0, high=53.0))])
+        self.assertTrue(any("整筆" in x for x in v))
+
+    def test_仍在價值區的碎片被拒(self):
+        v = self.validate([frz(sell(code="0053", qty=2, low=240.0, high=250.0))])
+        self.assertTrue(any("價值區" in x for x in v))
+
+    def test_不在凍結軌的標的被拒(self):
+        v = self.validate([frz(sell(code="2308", qty=30))])
+        self.assertTrue(any("不在凍結軌" in x for x in v))
+
+    def test_凍結軌不可買進(self):
+        v = self.validate([frz(buy(code="00911", qty=10, low=51.0, high=53.0))])
+        self.assertTrue(any("不可買進" in x for x in v))
+
+    def test_缺執行邊界不放行(self):
+        v = journal.validate_orders([frz(sell(code="00911", qty=15, low=51.0, high=53.0))],
+                                    FROZEN_PACKET, None)
+        self.assertTrue(any("執行邊界" in x for x in v))
 
 
 class TestTrackRouting(unittest.TestCase):
@@ -148,8 +210,11 @@ class TestTrackRouting(unittest.TestCase):
         self.assertTrue(any("2330" in x for x in v))
 
     def test_衛星軌買進不受價值區限制(self):
+        # 與本測試主題無關，關掉新的個股桶上限閘門
+        env = {**ENVELOPE, "satellite": {**ENVELOPE["satellite"],
+                                         "name_cap_value": None, "sector_cap_value": None}}
         self.assertEqual(self.validate([sat(buy(code="2330", qty=1,
-                                                low=2370.0, high=2390.0))]), [])
+                                                low=2370.0, high=2390.0))], envelope=env), [])
 
     def test_衛星軌買進超過配額被拒(self):
         v = self.validate([sat(buy(code="2330", qty=5, low=2370.0, high=2390.0))])
@@ -174,7 +239,11 @@ class TestTrackRouting(unittest.TestCase):
 
     def test_買賣互抵後淨賣出可放行(self):
         """同日既買又賣時看淨額：淨賣出不增加曝險，不該被配額擋"""
-        over = {**ENVELOPE, "tracks": {**ENVELOPE["tracks"],
+        # 與本測試主題無關，關掉新的個股桶上限閘門
+        over = {**ENVELOPE,
+                "satellite": {**ENVELOPE["satellite"],
+                              "name_cap_value": None, "sector_cap_value": None},
+                "tracks": {**ENVELOPE["tracks"],
                 "satellite": {**ENVELOPE["tracks"]["satellite"],
                               "value": 119000.0, "remaining": -70106.0}}}
         orders = [sat(sell(code="2330", qty=8, low=2330.0, high=2430.0)),
@@ -182,13 +251,36 @@ class TestTrackRouting(unittest.TestCase):
         self.assertEqual(self.validate(orders, envelope=over), [])
 
     def test_衛星軌標的須在白名單內(self):
-        """開新衛星標的要有人手動寫進 tracks.json，程式不自己擴充"""
+        """白名單只認當日 ARK 候選、目前持有與 tracks.json 指定，程式不自己擴充"""
         pk = {**LOSS_PACKET,
               "news_scope": {"codes": LOSS_PACKET["news_scope"]["codes"] + ["2317"]},
               "market": {"quotes": {**LOSS_PACKET["market"]["quotes"],
                                     "2317": {"close": 200.0}}}}
         v = self.validate([sat(buy(code="2317", qty=10, low=195.0, high=205.0))], pk)
         self.assertTrue(any("白名單" in x for x in v))
+
+    def test_已歸繼承軌的標的不可用個股桶加碼(self):
+        """換軌是人的決定：個股桶對繼承軌標的加碼等於偷偷把它搬進停損軌"""
+        env = {**ENVELOPE, "tracks": {
+            **ENVELOPE["tracks"],
+            "core": {"codes": [], "value": 0.0},
+            "inherited": {"codes": ["2308"], "value": 49500.0},
+            "satellite": {**ENVELOPE["tracks"]["satellite"],
+                          "allowlist": [*ENVELOPE["tracks"]["satellite"]["allowlist"],
+                                        "2308"]}}}
+        v = self.validate([sat(buy(code="2308", qty=1, low=1810.0, high=1830.0))],
+                          envelope=env)
+        self.assertTrue(any("目前歸 inherited 軌" in x for x in v), v)
+
+    def test_已歸繼承軌的標的仍可賣(self):
+        """賣不會改變軌道歸屬，擋賣只會讓部位卡住"""
+        env = {**ENVELOPE, "tracks": {
+            **ENVELOPE["tracks"],
+            "core": {"codes": [], "value": 0.0},
+            "inherited": {"codes": ["2330"], "value": 47600.0}}}
+        self.assertEqual(self.validate([sat(sell(code="2330", qty=20,
+                                                 low=2370.0, high=2390.0))],
+                                       envelope=env), [])
 
     def test_衛星軌部位不計入主軌檔數(self):
         """2330 歸衛星軌後，主軌只剩 2308 一檔，還買得下一檔"""
@@ -250,6 +342,54 @@ class TestTrackRouting(unittest.TestCase):
 
     def test_未標軌道者視為主軌(self):
         self.assertEqual(journal.validate_orders([sell()], PACKET, ENVELOPE), [])
+
+
+class TestSatelliteCaps(unittest.TestCase):
+    """個股桶硬閘門：買單執行後單檔與同產業市值不得超過 envelope 給的金額。"""
+    PACKET = {**LOSS_PACKET,
+              "market": {"quotes": {**LOSS_PACKET["market"]["quotes"],
+                                    "6274": {"close": 100.0}, "3374": {"close": 200.0}}}}
+    ENV = {**ENVELOPE,
+           "tracks": {**ENVELOPE["tracks"],
+                      "satellite": {**ENVELOPE["tracks"]["satellite"], "remaining": 100000.0}}}
+
+    def validate(self, orders):
+        return journal.validate_orders(orders, self.PACKET, self.ENV)
+
+    def test_新檔在上限內放行(self):
+        self.assertEqual(self.validate([sat(buy(code="6274", qty=200, low=99.0, high=101.0))]), [])
+
+    def test_買到超過單檔上限被拒(self):
+        v = self.validate([sat(buy(code="6274", qty=250, low=99.0, high=101.0))])    # 25,000 > 24,000
+        self.assertTrue(any("單檔上限" in x for x in v))
+
+    def test_加碼既有部位以執行後市值計(self):
+        v = self.validate([sat(buy(code="2330", qty=1, low=2370.0, high=2390.0))])
+        # 持有 2330 50 股，無 last_price 故退用估價 2,380：50×2,380+2,380=121,380 > 24,000
+        self.assertTrue(any("單檔上限" in x for x in v))
+
+    def test_同檔拆單合計仍受單檔上限(self):
+        """一次決策拆成兩張買單，執行後市值仍要合計計算，不能各自逃過上限"""
+        v = self.validate([sat(buy(code="6274", qty=150, low=99.0, high=101.0)),
+                           sat(buy(code="6274", qty=150, low=99.0, high=101.0))])  # 合計 30,000 > 24,000
+        self.assertTrue(any("單檔上限" in x for x in v))
+
+    def test_同產業合計超過產業上限被拒(self):
+        env = {**self.ENV, "satellite": {**self.ENV["satellite"],
+                                         "sectors": {**self.ENV["satellite"]["sectors"], "6274": "半導體"}}}
+        v = journal.validate_orders([sat(buy(code="6274", qty=100, low=99.0, high=101.0))],
+                                    self.PACKET, env)                                  # 47,600 + 10,000 > 50,000
+        self.assertTrue(any("產業上限" in x for x in v))
+
+    def test_沒有閘門值時不驗上限(self):
+        env = {**self.ENV, "satellite": {**self.ENV["satellite"],
+                                         "name_cap_value": None, "sector_cap_value": None}}
+        v = journal.validate_orders([sat(buy(code="6274", qty=250, low=99.0, high=101.0))],
+                                    self.PACKET, env)
+        self.assertEqual(v, [])
+
+    def test_賣單不驗上限(self):
+        self.assertEqual(self.validate([sat(sell(code="2330", qty=5, low=2370.0, high=2390.0))]), [])
 
 
 class TestRecordDecision(unittest.TestCase):
@@ -447,5 +587,165 @@ class TestPreviousWeekday(unittest.TestCase):
         self.assertEqual(journal.previous_weekday("2026-08-07"), "2026-08-06")
 
 
+class TestSatelliteExits(unittest.TestCase):
+    DECISION = {"orders": [
+        {"action": "sell", "code": "2330", "qty": 5, "track": "satellite"},
+        {"action": "sell", "code": "2308", "qty": 30, "track": "core"},
+        {"action": "buy", "code": "6274", "qty": 100, "track": "satellite"}]}
+    BEFORE = {"2330": {"qty": 18, "avg_price": 2000.0},
+              "2308": {"qty": 30, "avg_price": 1822.57}}
+
+    def test_個股桶賣單成交才記_主軌與買單不記(self):
+        fills = [{"code": "2330", "action": "sell", "qty": 5, "price": 1700.0},
+                 {"code": "2308", "action": "sell", "qty": 30, "price": 1900.0}]
+        out = journal.satellite_exits_from(self.DECISION, fills, self.BEFORE, stop_loss=-0.12)
+        self.assertEqual([r["code"] for r in out], ["2330"])
+        self.assertAlmostEqual(out[0]["roi"], -0.15)
+        self.assertTrue(out[0]["stopped"])
+
+    def test_獲利賣出不算停損(self):
+        fills = [{"code": "2330", "action": "sell", "qty": 5, "price": 2300.0}]
+        out = journal.satellite_exits_from(self.DECISION, fills, self.BEFORE, stop_loss=-0.12)
+        self.assertFalse(out[0]["stopped"])
+
+    def test_未成交不記(self):
+        self.assertEqual(journal.satellite_exits_from(self.DECISION, [], self.BEFORE, -0.12), [])
+
+    def test_append往返(self):
+        import risk
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "exits.jsonl")
+            journal.append_exits([{"date": "2026-09-10", "code": "2330", "roi": -0.15,
+                                   "stopped": True}], p)
+            self.assertEqual(risk.load_exits(p)[0]["code"], "2330")
+
+
+class TestSatelliteAssignments(unittest.TestCase):
+    """成交是事實才寫入 tracks.json：個股桶現在會買 ARK 候選裡沒人指派過的代號，
+    tracks.resolve 對未指派代號預設 core（無停損、套 ARK 紀律）——沒有這道，
+    填單成交後隔天就會被當成主軌部位。"""
+
+    DECISION = {"orders": [
+        {"action": "sell", "code": "2330", "qty": 5, "track": "satellite"},
+        {"action": "buy", "code": "6274", "qty": 100, "track": "satellite"},
+        {"action": "buy", "code": "00876", "qty": 50, "track": "core"}]}
+
+    def test_衛星軌買單成交才新增指派(self):
+        fills = [{"code": "6274", "action": "buy", "qty": 100, "price": 80.0}]
+        out = journal.satellite_assignments(self.DECISION, fills, {})
+        self.assertEqual(out, {"6274": tracks.SATELLITE})
+
+    def test_賣單不新增指派(self):
+        fills = [{"code": "2330", "action": "sell", "qty": 5, "price": 1700.0}]
+        out = journal.satellite_assignments(self.DECISION, fills, {})
+        self.assertEqual(out, {})
+
+    def test_主軌買單不新增指派(self):
+        fills = [{"code": "00876", "action": "buy", "qty": 50, "price": 90.0}]
+        out = journal.satellite_assignments(self.DECISION, fills, {})
+        self.assertEqual(out, {})
+
+    def test_未成交不新增指派(self):
+        out = journal.satellite_assignments(self.DECISION, [], {})
+        self.assertEqual(out, {})
+
+    def test_已是衛星軌則維持原物件不動(self):
+        assigned = {"6274": tracks.SATELLITE}
+        fills = [{"code": "6274", "action": "buy", "qty": 100, "price": 80.0}]
+        out = journal.satellite_assignments(self.DECISION, fills, assigned)
+        self.assertIs(out, assigned)
+
+    def test_已歸別軌的代號不被自動搬成衛星軌(self):
+        """自動指派只補「還沒人指定」的新倉；已歸繼承軌者搬軌要人改 tracks.json"""
+        assigned = {"6274": tracks.INHERITED}
+        fills = [{"code": "6274", "action": "buy", "qty": 100, "price": 80.0}]
+        out = journal.satellite_assignments(self.DECISION, fills, assigned)
+        self.assertIs(out, assigned)
+
+    def test_persist寫回tracks檔(self):
+        fills = [{"code": "6274", "action": "buy", "qty": 100, "price": 80.0}]
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "tracks.json")
+            journal.persist_satellite_assignments(self.DECISION, fills, path=p)
+            self.assertEqual(tracks.load(p), {"6274": tracks.SATELLITE})
+
+
+class FakeBroker:
+    stock_account = object()
+
+    def __init__(self, pl_rows, positions):
+        self.pl_rows, self.positions = pl_rows, positions
+        self.pl_range = None
+
+    def list_profit_loss(self, account, start, end, unit=None):
+        self.pl_range = (start, end)
+        return [types.SimpleNamespace(code=c, quantity=q, price=p) for c, q, p in self.pl_rows]
+
+    def list_positions(self, account, unit=None):
+        return [types.SimpleNamespace(code=c, quantity=q, price=p) for c, q, p in self.positions]
+
+
+class TestSettleDay(unittest.TestCase):
+    """成交後立刻結算當日決策：fill 的 date 與 decision_ref 同一天，損益查的也是當天"""
+    D = "2026-08-10"
+
+    def test_當日結算(self):
+        api = FakeBroker(pl_rows=[("2308", 30, 1650.0)], positions=[("2330", 50, 2062.38)])
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "journal.jsonl")
+            entry, _ = journal.record_decision(decision([sell()]), PACKET, [])
+            journal.append_entry(entry, path)
+            # settle_day 查損益要帶 sj.Unit.Share；塞假模組讓乾淨環境（未裝 shioaji）也能跑
+            fake_sj = types.SimpleNamespace(Unit=types.SimpleNamespace(Share="Share"))
+            with mock.patch.dict(sys.modules, {"shioaji": fake_sj}), \
+                 mock.patch.object(journal.market, "fetch_daily", return_value=[{"date": self.D}]), \
+                 mock.patch("packet.load_packet", return_value=PACKET), \
+                 mock.patch.object(journal, "append_exits"), \
+                 mock.patch.object(journal, "persist_satellite_assignments"):
+                out = journal.settle_day(api, self.D, self.D, path=path)
+        self.assertEqual((out["type"], out["date"], out["decision_ref"]),
+                         ("fill", self.D, self.D))
+        self.assertEqual(api.pl_range, (self.D, self.D))
+        self.assertEqual([(f["code"], f["qty"]) for f in out["fills"]], [("2308", 30)])
+
+    def test_結算前一日是當日結算的特例(self):
+        api = FakeBroker([], [])
+        with mock.patch.object(journal, "settle_day", return_value="entry") as sd:
+            self.assertEqual(journal.settle_previous(api, "2026-08-11", path="p"), "entry")
+        sd.assert_called_once_with(api, "2026-08-10", "2026-08-11", "p", None)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------- 確認無燈號必賣（使用者 2026-10-08 明示）
+
+LAMP_ENVELOPE = {**ENVELOPE, "satellite": {**ENVELOPE["satellite"],
+                                           "lamp_exits": [{"code": "2330", "qty": 50}]}}
+
+
+def lamp_violations(orders, envelope=LAMP_ENVELOPE):
+    return [v for v in journal.validate_orders(orders, LOSS_PACKET, envelope) if "無燈號" in v]
+
+
+class TestRequiredLampExits(unittest.TestCase):
+    def test_確認無燈號卻沒賣_違規(self):
+        self.assertTrue(lamp_violations([]))
+
+    def test_只賣一部分_違規(self):
+        self.assertTrue(lamp_violations([sat(sell("2330", 20, 2300.0, 2400.0))]))
+
+    def test_整筆賣出_合規(self):
+        self.assertEqual(lamp_violations([sat(sell("2330", 50, 2300.0, 2400.0))]), [])
+
+    def test_沒有必賣清單_不誤觸發(self):
+        self.assertEqual(lamp_violations([], ENVELOPE), [])
+
+    def test_不能賣的日子不強制(self):
+        self.assertEqual(lamp_violations([], {**LAMP_ENVELOPE, "can_sell": False}), [])
+
+    def test_今天不動的決策被拒(self):
+        entry, v = journal.record_decision(decision([]), LOSS_PACKET, [], envelope=LAMP_ENVELOPE)
+        self.assertIsNone(entry)
+        self.assertTrue(any("2330" in x for x in v))

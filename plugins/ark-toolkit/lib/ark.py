@@ -353,13 +353,27 @@ def wait_for(ax, pid, pred, what, timeout=10.0):
 
     不要用固定 sleep 假設操作完成——App 從別頁返回時載入時間不定，
     固定等待會造成「手動測試會過、自動連續執行卻失敗」的間歇性錯誤。
+
+    背景操作下 `ax.window` 會瞬間讀不到視窗（AXWindows 與 AXMainWindow 同時
+    回空，換頁或彈出面板的一瞬間常見；2026-09-07 兩次 packet 各在不同步驟
+    因此中斷）。那當成「還沒好」繼續等；到期仍讀不到才把 ArkNotRunning 拋出，
+    讓上層分得出「App 不在」與「畫面沒到」。
     """
+    not_running = getattr(ax, "ArkNotRunning", ())
     deadline = time.time() + timeout
+    last_missing = None
     while time.time() < deadline:
-        w = ax.window(pid)
-        if pred(w):
-            return w
+        try:
+            w = ax.window(pid)
+        except not_running as e:
+            last_missing = e
+        else:
+            last_missing = None
+            if pred(w):
+                return w
         time.sleep(0.4)
+    if last_missing is not None:
+        raise last_missing
     raise RuntimeError(f"等待逾時：{what}")
 
 
@@ -384,7 +398,37 @@ def press_verified(ax, pid, el, pred, what, timeout=6.0):
         return wait_for(ax, pid, pred, what, timeout=timeout)
 
 
-def ensure_responsive(ax, pid, probe_timeout=6.0):
+# 冷啟後的公告／推播彈窗上的關閉鈕。這類視窗沒有 tab bar 也沒有 back，
+# 不先按掉，就緒探測會把 App 誤判成殭屍態而重啟（2026-09-09／09-10 各循環兩次）。
+DISMISS_LABELS = ("下次再說", "稍後再說", "我知道了", "關閉")
+
+
+def dismiss_popups(ax, pid, labels=DISMISS_LABELS):
+    """按掉擋在主畫面前的公告彈窗；回傳是否按過。只按關閉鈕，不按「立即前往」類。"""
+    w = ax.window(pid)
+    for label in labels:
+        btn = ax.by_desc(w, label)
+        if btn:
+            ax.press(btn[0])
+            time.sleep(1.0)
+            return True
+    return False
+
+
+class ArkLoggedOut(RuntimeError):
+    """App 停在登入頁（session 過期）。重啟救不了，要人登入。"""
+
+
+def raise_if_logged_out(ax, w):
+    """登入頁沒有 tab bar 也沒有 back，就緒探測會把它當成殭屍態重啟再空等，
+    最後報的是「tab bar 逾時」——錯誤訊息指向冷啟太慢，真正原因卻是被登出
+    （2026-09-27 實錄）。認得登入頁就直接說。"""
+    if ax.by_desc(w, "會員登入"):
+        raise ArkLoggedOut("ARK 已登出（停在登入頁）——請先在 App 登入再重跑；"
+                           "重啟無法恢復")
+
+
+def ensure_responsive(ax, pid, probe_timeout=6.0, ready_timeout=60.0):
     """驗證 UI 事件層活著；死了（殭屍態）就重啟 App 一次，回傳可用 pid。
 
     殭屍態＝AX 讀得到、更新倒數在走，但所有輸入事件無效且 AXPress 仍回
@@ -392,6 +436,7 @@ def ensure_responsive(ax, pid, probe_timeout=6.0):
     地標的底部 tab。探測完 App 停在自選或運算頁，都是後續導航的合法起點。
     """
     def probe(pid):
+        dismiss_popups(ax, pid)
         w = ax.window(pid)
         if not ax.by_desc(w, "自選"):            # 停在子頁：先退回 tab 根頁
             back = ax.by_desc(w, "back")
@@ -418,13 +463,25 @@ def ensure_responsive(ax, pid, probe_timeout=6.0):
 
     if probe(pid):
         return pid
+    raise_if_logged_out(ax, ax.window(pid))
     pid = ax.restart_app()
+
+    def tab_bar_up(w):
+        raise_if_logged_out(ax, w)
+        return bool(ax.by_desc(w, "自選")) or dismiss_popups(ax, pid)
+
     # restart_app 在 AXWindows 一讀得到就回來，那時多半還是冷啟動的過場畫面：
     # 沒有 tab bar 也沒有 back，probe 會立刻回 False，被誤報成「重啟後仍無效」
     # （2026-09-02 實錄，其實一分鐘後 App 好端端停在策略頁）。先等 tab bar 出現。
-    wait_for(ax, pid, lambda w: bool(ax.by_desc(w, "自選")), "重啟後 tab bar 出現", timeout=90.0)
-    if not probe(pid):
-        raise RuntimeError("ARK UI 無回應，重啟後仍無效")
+    wait_for(ax, pid, tab_bar_up, "重啟後 tab bar 出現", timeout=90.0)
+    # tab bar 出現不代表事件層已接得住輸入（dismiss_popups 回 True 也算通過）。
+    # 2026-10-05 只試一次 probe 就判死，全程 13 秒，事後 App 好端端停在運算頁。
+    try:
+        wait_for(ax, pid, lambda w: probe(pid), "重啟後 UI 回應", timeout=ready_timeout)
+    except getattr(ax, "ArkNotRunning", ()):
+        raise                       # App 不在 ≠ 無回應，別混成同一句
+    except RuntimeError:
+        raise RuntimeError("ARK UI 無回應，重啟後仍無效") from None
     return pid
 
 
@@ -432,6 +489,21 @@ def visible_codes(ax, pid):
     return tuple(sorted(h.code for h in
                         (parse_holding(d) for _e, d in ax.descs(ax.window(pid), "AXStaticText"))
                         if h))
+
+
+def _wait_settled(probe, interval=0.3, max_polls=10):
+    """翻頁後等畫面靜止：連續兩次探測相同才算。
+
+    翻頁動畫中途 AX tree 只暴露兩三列，那時收集會整段跳列（2026-10-10 實機
+    17 檔只讀到 13～14 檔）。到上限仍在變就照當下畫面走，交給 check_parsed 把關。
+    """
+    last = probe()
+    for _ in range(max_polls):
+        time.sleep(interval)
+        current = probe()
+        if current == last:
+            return
+        last = current
 
 
 def _scroll_until_stable(step, probe, collect, max_rounds):
@@ -444,6 +516,7 @@ def _scroll_until_stable(step, probe, collect, max_rounds):
             return
         previous = current
         step()
+        _wait_settled(probe)
     raise RuntimeError("捲動未收斂，可能畫面持續變動")
 
 
@@ -828,7 +901,12 @@ def write_posture_cash(ax, pid, value):
 
         每次點擊前重讀視窗幾何：使用者中途搬動視窗的話，用舊座標會點到
         別的東西上。幾何一變就中止。
+
+        座標點擊走全域滑鼠事件，落在該座標最上層的視窗：ARK 被別的視窗蓋住時
+        會點到那個視窗上，欄位維持原值（2026-09-28 實錄）。其餘操作都能在背景做，
+        只有這一段要先把 ARK 帶到前景。
         """
+        ax.activate()
         ax.press(ax.text_fields(ax.window(pid))[POSTURE_CASH_FIELD])
         time.sleep(1.0)
         win = ax.window(pid)

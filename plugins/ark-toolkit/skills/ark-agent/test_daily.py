@@ -1,5 +1,9 @@
 """每日編排的純邏輯測試（不需要 ARK、Shioaji 或 launchd，任何平台可跑）"""
+import json
+import os
+import tempfile
 import unittest
+from unittest import mock
 
 import daily
 
@@ -173,6 +177,12 @@ class TestReviewPromptRendering(unittest.TestCase):
             daily.render_review_prompt("讀 REVIEW_PATH 和 MYSTERY_PATH", review="/r",
                                        rules="/x", doc="/d", date="2026-09-04")
 
+    def test_複盤提示帶閘門檔路徑(self):
+        out = daily.render_review_prompt("R=REVIEW_PATH G=GATES_PATH D=TODAY",
+                                         "/r.txt", "/rules.md", "/doc.md", "2026-09-12",
+                                         gates_path="/docs/gates.json")
+        self.assertIn("G=/docs/gates.json", out)
+
 
 class TestReviewDocPath(unittest.TestCase):
     def test_檢討記錄放在準則檔旁的decision_reviews(self):
@@ -207,3 +217,297 @@ class TestRulesIntact(unittest.TestCase):
 
     def test_原本沒有準則時新增即完整(self):
         self.assertTrue(daily.rules_intact("", "### R-001 甲\n內文\n"))
+
+
+class TestGatesGuard(unittest.TestCase):
+    def test_複盤改壞閘門就還原(self):
+        import gates
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "gates.json")
+            before = json.dumps(gates.DEFAULTS)
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps({**gates.DEFAULTS, "name_cap": 0.30}))
+            restored = daily.guard_gates(p, before, mode="test")
+            self.assertTrue(restored)
+            with open(p, encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh), gates.DEFAULTS)
+
+    def test_合法改動不動它(self):
+        import gates
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "gates.json")
+            before = json.dumps(gates.DEFAULTS)
+            after = {**gates.DEFAULTS, "name_cap": 0.13}
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(after))
+            self.assertFalse(daily.guard_gates(p, before, mode="test"))
+            with open(p, encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh), after)
+
+
+class TestDecidePromptMentionsSatelliteBucket(unittest.TestCase):
+    def test_提示含個股桶三道閘門與候選來源(self):
+        with open(os.path.join(os.path.dirname(daily.__file__), "prompts", "decide.md"),
+                  encoding="utf-8") as fh:
+            text = fh.read()
+        for needle in ("industry.candidates", "name_cap_value", "sector_cap_value",
+                       "trim_candidates", "heating"):
+            self.assertIn(needle, text)
+
+
+class TestTradeWindow(unittest.TestCase):
+    """手動一場（trade）不看排定時刻，只看是否還來得及在收盤前等單＋結算"""
+
+    def test_交易窗含端點(self):
+        for now in ("09:00", "10:43", "13:00"):
+            self.assertTrue(daily.is_within_range(now, "09:00", "13:00"), now)
+
+    def test_交易窗之外拒絕(self):
+        for now in ("08:59", "13:01", "21:37"):
+            self.assertFalse(daily.is_within_range(now, "09:00", "13:00"), now)
+
+    def test_trade為合法模式(self):
+        self.assertIn("trade", daily.MODES)
+
+
+class TestHasDecision(unittest.TestCase):
+    D = "2026-09-22"
+
+    def test_當日有決策為真(self):
+        self.assertTrue(daily.has_decision([{"type": "decision", "date": self.D}], self.D))
+
+    def test_只有成交對回不算(self):
+        self.assertFalse(daily.has_decision(
+            [{"type": "fill", "date": self.D, "decision_ref": "2026-09-21"}], self.D))
+
+    def test_別天的決策不算(self):
+        self.assertFalse(daily.has_decision([{"type": "decision", "date": "2026-09-21"}], self.D))
+
+
+class TestTradeOrchestration(unittest.TestCase):
+    """trade 的順序寫死：對帳 → 決策送單（含等成交）→ 當日結算；任一前段失敗即停"""
+    D = "2026-09-22"
+    DECISION = {"type": "decision", "date": "2026-09-22"}
+
+    def setUp(self):
+        for name in ("notify", "log"):
+            p = mock.patch.object(daily, name, lambda *a, **k: None)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(daily, "in_trade_window", return_value=True)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def run_trade(self, run_rc, journals, decide_rc=0):
+        calls = []
+
+        def fake_run(mode, *args):
+            calls.append(args)
+            return run_rc
+
+        with mock.patch.object(daily, "run", fake_run), \
+             mock.patch.object(daily, "load_journal", side_effect=journals), \
+             mock.patch.object(daily, "_decide_steps", return_value=decide_rc) as ds:
+            rc = daily.trade(self.D, "live")
+        return rc, calls, ds
+
+    def test_對帳失敗就不進決策(self):
+        rc, calls, ds = self.run_trade(run_rc=1, journals=[[]])
+        self.assertEqual(rc, 1)
+        self.assertEqual([c[0] for c in calls], [daily.SYNC])
+        ds.assert_not_called()
+
+    def test_一場順序_對帳_決策_當日結算(self):
+        rc, calls, ds = self.run_trade(run_rc=0, journals=[[], [self.DECISION]])
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls[0][0], daily.SYNC)
+        ds.assert_called_once_with("trade", self.D, "live", True, 30)
+        settle = next(c for c in calls if str(c[0]).endswith("journal.py"))
+        self.assertEqual(settle[1:], ("settle", "--same-day"))
+        self.assertTrue(str(calls[-1][0]).endswith("record_return.py"))
+
+    def test_當日已有決策不再交易(self):
+        rc, calls, ds = self.run_trade(run_rc=0, journals=[[self.DECISION]])
+        self.assertEqual(rc, 1)
+        self.assertEqual(calls, [])
+        ds.assert_not_called()
+
+    def test_邊界全面阻擋時沒有決策也不結算(self):
+        rc, calls, _ = self.run_trade(run_rc=0, journals=[[], []])
+        self.assertEqual(rc, 0)
+        self.assertEqual([c[0] for c in calls], [daily.SYNC])
+
+
+class TestSettleStepsSameDay(unittest.TestCase):
+    def test_當日結算把same_day旗標傳給journal(self):
+        calls = []
+        with mock.patch.object(daily, "run", lambda mode, *a: calls.append(a) or 0), \
+             mock.patch.object(daily, "log", lambda *a, **k: None):
+            daily._settle_steps("trade", same_day=True)
+        self.assertEqual(calls[0][1:], ("settle", "--same-day"))
+
+    def test_排程結算不帶same_day(self):
+        calls = []
+        with mock.patch.object(daily, "run", lambda mode, *a: calls.append(a) or 0), \
+             mock.patch.object(daily, "log", lambda *a, **k: None):
+            daily._settle_steps("settle")
+        self.assertEqual(calls[0][1:], ("settle",))
+
+
+class TestHolidaySkip(unittest.TestCase):
+    """packet 回報休市（離開碼 3）＝今天不交易，不是故障；不可往下用舊行情做決策。"""
+
+    def steps(self, packet_rc):
+        calls = []
+
+        def fake_run(mode, *args):
+            calls.append(os.path.basename(args[0]))
+            return packet_rc if args[0].endswith("packet.py") else 0
+        with mock.patch.object(daily, "run", fake_run), \
+             mock.patch.object(daily, "notify", lambda *a, **k: None), \
+             mock.patch.object(daily, "ask_model") as model:
+            rc = daily._decide_steps("decide", "2026-10-09", "simulation", True, None)
+        return rc, calls, model
+
+    def test_休市_跳過且不跑風控與決策層(self):
+        rc, calls, model = self.steps(daily.PACKET_MARKET_CLOSED)
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, ["packet.py"])
+        model.assert_not_called()
+
+    def test_決策包其他失敗仍是故障(self):
+        rc, calls, model = self.steps(1)
+        self.assertEqual(rc, 1)
+        model.assert_not_called()
+
+
+class TestDecidePromptFieldSemantics(unittest.TestCase):
+    """suggest_qty 是建議調節（賣出）股數，不是持有目標；燈號必賣由 lamp_exits 給出。"""
+
+    def text(self, name):
+        with open(os.path.join(os.path.dirname(daily.__file__), "prompts", name),
+                  encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_決策提示寫明欄位語意與燈號規則(self):
+        text = daily.render_prompt(self.text("decide.md"), "P", "E", "D", "2026-10-12")
+        for needle in ("建議調節（賣出）股數", "不是持有目標", "持有 − suggest_qty",
+                       "lamp_exits", "確認無燈號", "unknown", "未經複盤", "只適用減碼"):
+            self.assertIn(needle, text)
+
+    def test_複盤提示要求處理待複盤事項(self):
+        text = daily.render_review_prompt(self.text("review.md"), "R", "RULES", "DOC", "2026-10-09")
+        self.assertIn("待複盤事項", text)
+
+
+class TestReviewSince(unittest.TestCase):
+    """複盤區間從上次**成功**複盤的隔天起算——某次複盤失敗時，那幾天的案例
+    不會永遠掉出 7 天視窗（2026-10-02 實錄）。輸入是已完成的複盤迄日。"""
+
+    def test_從上次成功複盤隔天起算(self):
+        self.assertEqual(daily.review_since(["2026-09-04", "2026-09-27"], "2026-10-09"),
+                         "2026-09-28")
+
+    def test_沒有前次複盤_用預設視窗(self):
+        self.assertIsNone(daily.review_since([], "2026-10-09"))
+
+    def test_上次複盤太久以前_最多回看28天(self):
+        self.assertEqual(daily.review_since(["2026-06-01"], "2026-10-09"), "2026-09-12")
+
+    def test_上次複盤就在近期_不比預設視窗短(self):
+        self.assertIsNone(daily.review_since(["2026-10-08"], "2026-10-09"))
+
+
+class TestCompletedReviews(unittest.TestCase):
+    """哪些複盤算完成：成功紀錄（completed.jsonl）為準；成功紀錄機制上線前的
+    檢討檔（9/04、9/11、9/27）保守兼容。之後只有檢討檔、沒有成功紀錄的＝失敗嘗試。"""
+
+    DOCS = ["2026-09-04.md", "2026-09-27.md", "2026-10-08-learning.md", "README.md"]
+
+    def test_上線前的檢討檔算完成(self):
+        self.assertEqual(daily.completed_reviews([], self.DOCS), ["2026-09-04", "2026-09-27"])
+
+    def test_上線後只有檢討檔沒有成功紀錄_不算完成(self):
+        done = daily.completed_reviews([], self.DOCS + ["2026-10-09.md"])
+        self.assertNotIn("2026-10-09", done)
+        self.assertEqual(daily.review_since(done, "2026-10-16"), "2026-09-28")
+
+    def test_成功紀錄推進起日(self):
+        done = daily.completed_reviews([{"until": "2026-10-09", "ok": True}],
+                                       self.DOCS + ["2026-10-09.md"])
+        self.assertEqual(done[-1], "2026-10-09")
+        self.assertEqual(daily.review_since(done, "2026-10-23"), "2026-10-10")
+
+    def test_壞紀錄不算(self):
+        done = daily.completed_reviews([{"until": "2026-10-09", "ok": False}, {"ts": "x"},
+                                        {"until": "not-a-date", "ok": True}], [])
+        self.assertEqual(done, [])
+
+
+class TestReviewRecordsOnlyOnSuccess(unittest.TestCase):
+    """失敗的複盤嘗試即使已寫出檢討檔，也不能留下成功紀錄、不能推進下次起日。"""
+
+    DATE = "2026-10-09"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.state = os.path.join(self.tmp, "state")
+        self.docs = os.path.join(self.tmp, "docs")
+        os.makedirs(os.path.join(self.docs, "decision-reviews"))
+        self.rules = os.path.join(self.docs, "decision-rules.md")
+        with open(self.rules, "w", encoding="utf-8") as fh:
+            fh.write("# 決策準則\n\n### R-001 甲\n內容\n")
+        with open(os.path.join(self.docs, "decision-reviews", "2026-09-27.md"), "w") as fh:
+            fh.write("舊的已完成複盤")
+
+    def run_review(self, rc, break_rules=False):
+        import packet
+        import gates
+        doc = daily.review_doc_path(self.rules, self.DATE)
+
+        def fake_model(mode, prompt, model, tools=None, cwd=None):
+            with open(doc, "w", encoding="utf-8") as fh:
+                fh.write("模型先寫出的檢討記錄")
+            if break_rules:
+                with open(self.rules, "w", encoding="utf-8") as fh:
+                    fh.write("# 決策準則\n（編號被刪光）\n")
+            return rc, "結論"
+        noop = lambda *a, **k: None
+        with mock.patch.object(daily, "STATE", self.state), \
+             mock.patch.object(daily, "in_window", return_value=True), \
+             mock.patch.object(daily, "run", lambda mode, *a: 0), \
+             mock.patch.object(daily, "ask_model", fake_model), \
+             mock.patch.object(daily, "notify", noop), \
+             mock.patch.object(daily, "log", noop), \
+             mock.patch.object(daily, "commit_files", noop), \
+             mock.patch.object(packet, "RULES_PATH", self.rules), \
+             mock.patch.object(gates, "default_path",
+                               return_value=os.path.join(self.tmp, "gates.json")):
+            result = daily.review(self.DATE)
+            records = daily.load_review_records()
+        done = daily.completed_reviews(records, os.listdir(os.path.dirname(doc)))
+        return result, records, done, os.path.exists(doc)
+
+    def test_模型非零離開_檔案留著但不算完成(self):
+        result, records, done, doc_left = self.run_review(rc=1)
+        self.assertEqual(result, 1)
+        self.assertTrue(doc_left)                      # 不刪失敗檔
+        self.assertEqual(records, [])
+        self.assertEqual(daily.review_since(done, "2026-10-16"), "2026-09-28")
+
+    def test_準則被改壞_還原且不算完成(self):
+        result, records, done, doc_left = self.run_review(rc=0, break_rules=True)
+        self.assertEqual(result, 1)
+        self.assertTrue(doc_left)
+        self.assertEqual(records, [])
+        self.assertIn("R-001", open(self.rules, encoding="utf-8").read())
+        self.assertEqual(daily.review_since(done, "2026-10-16"), "2026-09-28")
+
+    def test_成功才寫紀錄_記下涵蓋區間(self):
+        result, records, done, _ = self.run_review(rc=0)
+        self.assertEqual(result, 0)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["until"], self.DATE)
+        self.assertEqual(records[0]["since"], "2026-09-28")
+        self.assertTrue(records[0]["ok"])
+        self.assertEqual(done[-1], self.DATE)

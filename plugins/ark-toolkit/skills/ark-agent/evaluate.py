@@ -169,6 +169,12 @@ def core_orders(decision):
             if o.get("track", journal.CORE) == journal.CORE]
 
 
+def satellite_orders(decision):
+    """個股桶委託。與主軌分開統計：它不受 ARK 紀律約束，成績要能單獨被檢討。"""
+    return [o for o in decision.get("orders", [])
+            if o.get("track") == journal.SATELLITE]
+
+
 def adherence(decision, pk, fill_entry):
     """單日紀律分項與合成分。合成分＝通過的布林項 ÷ 適用項數（不適用不計分母）。"""
     disc = pk["discipline"]
@@ -197,8 +203,10 @@ def adherence(decision, pk, fill_entry):
     fully_sold = {o["code"] for o in sells
                   if o["code"] in positions and o["qty"] >= positions[o["code"]]["qty"]}
     names_after = (set(positions) - fully_sold) | {o["code"] for o in buys}
-    # 與 journal.validate_orders 同規則:既有超限不歸咎於本日決策
-    comps["檔數未超限"] = len(names_after) <= max(disc["max_names"], len(positions))
+    # 與 journal.validate_orders 同規則:既有超限不歸咎於本日決策；
+    # 檔數為參考值（names_cap = advisory）時買幾檔由決策層判斷，這一項不適用
+    if disc.get("names_cap", "hard") != "advisory":
+        comps["檔數未超限"] = len(names_after) <= max(disc["max_names"], len(positions))
     comps["非修訂決策"] = not decision.get("amended")
     comps["無硬規則覆寫"] = not decision.get("violations")
 
@@ -225,6 +233,43 @@ def fills_by_ref(entries):
     return out
 
 
+def _order_rows(orders, date, fills_for_day, daily, bench_daily, calendar, dividends):
+    fills = {(f["action"], f["code"]): f for f in (fills_for_day or {}).get("fills", [])}
+    rows = []
+    for o in orders:
+        f = fills.get((o["action"], o["code"]))
+        price, exec_status = exec_price_for(o, date, f, daily, calendar)
+        row = {"date": date, "action": o["action"], "code": o["code"],
+               "qty": o["qty"], "exec_price": price, "exec_status": exec_status,
+               "horizons": {}}
+        if price is not None:
+            for n in HORIZONS:
+                row["horizons"][n] = horizon_result(
+                    o, date, price, n, daily.get(o["code"], {}), bench_daily, calendar, dividends)
+        rows.append(row)
+    return rows
+
+
+def _horizon_stats(orders_out):
+    horizons = {}
+    for n in HORIZONS:
+        rows = [r["horizons"].get(n, {}) for r in orders_out]
+        done = [r for r in rows if "return_adj" in r]
+        horizons[n] = {
+            "evaluated": len(done),
+            "pending": sum(1 for r in rows if r.get("status") == "pending"),
+            "unevaluable": sum(1 for r in rows if r.get("status") == "unevaluable"),
+            "dividend_affected": sum(1 for r in done if r.get("dividend_affected")),
+            "win_rate": (round(sum(1 for r in done if r["return_adj"] > 0) / len(done), 4)
+                         if done else None),
+            "avg_return": (round(sum(r["return_adj"] for r in done) / len(done), 6)
+                           if done else None),
+            "avg_excess": (round(sum(r["excess"] for r in done if "excess" in r) / len(done), 6)
+                           if done else None),
+        }
+    return horizons
+
+
 def evaluate_all(entries, packets, prices, benchmark_bars, dividends,
                  orders_of=core_orders):
     """`orders_of` 決定要評估哪些委託，預設只取主軌以維持實驗效度。
@@ -241,43 +286,19 @@ def evaluate_all(entries, packets, prices, benchmark_bars, dividends,
     overrides = sum(1 for e in entries
                     if e.get("type") == "decision" and e.get("violations"))
 
-    orders_out, adherence_rows = [], []
+    orders_out, sat_out, adherence_rows = [], [], []
     for date in decision_dates:
         d = journal.first_decision(entries, date)
         pk = packets.get(date)
         fe = fills.get(date)
         if pk:
             adherence_rows.append(adherence(d, pk, fe))
-        fills = {(f["action"], f["code"]): f for f in (fe or {}).get("fills", [])}
-        for o in orders_of(d):
-            f = fills.get((o["action"], o["code"]))
-            price, exec_status = exec_price_for(o, date, f, daily, calendar)
-            row = {"date": date, "action": o["action"], "code": o["code"],
-                   "qty": o["qty"], "exec_price": price, "exec_status": exec_status,
-                   "horizons": {}}
-            if price is not None:
-                for n in HORIZONS:
-                    row["horizons"][n] = horizon_result(
-                        o, date, price, n, daily.get(o["code"], {}),
-                        bench_daily, calendar, dividends)
-            orders_out.append(row)
-
-    horizons = {}
-    for n in HORIZONS:
-        rows = [r["horizons"].get(n, {}) for r in orders_out]
-        done = [r for r in rows if "return_adj" in r]
-        horizons[n] = {
-            "evaluated": len(done),
-            "pending": sum(1 for r in rows if r.get("status") == "pending"),
-            "unevaluable": sum(1 for r in rows if r.get("status") == "unevaluable"),
-            "dividend_affected": sum(1 for r in done if r.get("dividend_affected")),
-            "win_rate": (round(sum(1 for r in done if r["return_adj"] > 0)
-                               / len(done), 4) if done else None),
-            "avg_return": (round(sum(r["return_adj"] for r in done)
-                                 / len(done), 6) if done else None),
-            "avg_excess": (round(sum(r["excess"] for r in done if "excess" in r)
-                                 / len(done), 6) if done else None),
-        }
+        # orders_of=all_orders（review.py 複盤）時，衛星軌委託會同時落入
+        # orders_out 與 sat_out——刻意雙重計數，主軌是給複盤看全貌，satellite 是給
+        # 個股桶單獨檢討，兩者本來就回答不同問題。
+        orders_out += _order_rows(orders_of(d), date, fe, daily, bench_daily, calendar, dividends)
+        sat_out += _order_rows(satellite_orders(d), date, fe, daily, bench_daily, calendar, dividends)
+    horizons = _horizon_stats(orders_out)
 
     scores = [a["score"] for a in adherence_rows]
     coverages = [a["coverage"] for a in adherence_rows if a["coverage"] is not None]
@@ -296,6 +317,8 @@ def evaluate_all(entries, packets, prices, benchmark_bars, dividends,
             "days": adherence_rows,
         },
         "orders": orders_out,
+        "satellite": {"n_orders": len(sat_out), "horizons": _horizon_stats(sat_out),
+                      "orders": sat_out},
     }
 
 
@@ -313,6 +336,18 @@ def render(report):
         exc = f"{h['avg_excess']:+.2%}" if h["avg_excess"] is not None else "-"
         out.append(f"  T+{n:<4} {h['evaluated']:>3}/{h['pending']:<4}  {win:>6}"
                    f"   {ret:>9}   {exc:>15}   {h['dividend_affected']} 筆")
+    s = report.get("satellite", {})
+    out.append(f"\n【個股桶】單量 {s.get('n_orders', 0)}（不受 ARK 紀律約束，與主軌分開統計）")
+    sat_horizons = s.get("horizons", {})
+    if sat_horizons:
+        out.append("  視窗   已評/待期   勝率     平均報酬   平均超額(vs 0050)")
+    for n, h in sat_horizons.items():
+        win = f"{h['win_rate']:.0%}" if h["win_rate"] is not None else "-"
+        ret = f"{h['avg_return']:+.2%}" if h["avg_return"] is not None else "-"
+        exc = f"{h['avg_excess']:+.2%}" if h["avg_excess"] is not None else "-"
+        out.append(f"  T+{n:<4} {h['evaluated']:>3}/{h['pending']:<4}  {win:>6}"
+                   f"   {ret:>9}   {exc:>15}")
+
     a = report["adherence"]
     out.append("\n【ARK 紀律遵循度】")
     score = f"{a['avg_score']:.0%}" if a["avg_score"] is not None else "-"

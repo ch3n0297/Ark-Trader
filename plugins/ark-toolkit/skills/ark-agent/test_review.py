@@ -287,6 +287,98 @@ class TestRuleAttribution(unittest.TestCase):
         self.assertEqual(perf["R-004"]["n_evaluated"], 0)
 
 
+class TestRuleAttributionPerOrder(unittest.TestCase):
+    """準則掛在決策層時，當天每筆單都記到當天每條準則頭上——決策若每天把準則全列，
+    各條的數字就一模一樣，分不出功過（2026-09-27 複盤：R-003 與 R-004 完全相同）。
+    委託帶自己的 `rules_applied` 時，只歸給驅動那筆單的準則。"""
+
+    def h(self, ret, excess=None):
+        out = {"return_adj": ret}
+        if excess is not None:
+            out["excess"] = excess
+        return {5: out}
+
+    def test_委託帶自己的準則時只歸給那幾條(self):
+        cases = [{"date": "2026-09-29", "rules_applied": ["R-002", "R-006"],
+                  "orders": [{"code": "0056", "rules_applied": ["R-002"],
+                              "horizons": self.h(0.02)},
+                             {"code": "2383", "rules_applied": ["R-006"],
+                              "horizons": self.h(-0.08)}]}]
+        perf = review.rule_performance(cases, horizon=5)
+        self.assertEqual(perf["R-002"]["n_evaluated"], 1)
+        self.assertAlmostEqual(perf["R-002"]["avg_return"], 0.02, places=6)
+        self.assertAlmostEqual(perf["R-006"]["avg_return"], -0.08, places=6)
+
+    def test_委託明示空清單時不退回決策層(self):
+        """`[]` 是「這筆單沒有準則驅動」，缺欄位才是舊資料"""
+        cases = [{"date": "2026-09-29", "rules_applied": ["R-005"],
+                  "orders": [{"code": "0050", "rules_applied": [],
+                              "horizons": self.h(0.03)}]}]
+        perf = review.rule_performance(cases, horizon=5)
+        self.assertEqual(perf["R-005"]["n_evaluated"], 0)
+        self.assertEqual(perf["R-005"]["n_decisions"], 1)
+
+    def test_同一天多筆單引用同一條只算一個採用日(self):
+        cases = [{"date": "2026-09-29", "rules_applied": ["R-002"],
+                  "orders": [{"code": "0050", "rules_applied": ["R-002"],
+                              "horizons": self.h(0.01)},
+                             {"code": "0056", "rules_applied": ["R-002"],
+                              "horizons": self.h(0.03)}]}]
+        perf = review.rule_performance(cases, horizon=5)
+        self.assertEqual(perf["R-002"]["n_decisions"], 1)
+        self.assertEqual(perf["R-002"]["n_evaluated"], 2)
+
+    def test_只出現在委託上的準則也要進表(self):
+        cases = [{"date": "2026-09-29", "rules_applied": [],
+                  "orders": [{"code": "0056", "rules_applied": ["R-004"],
+                              "horizons": self.h(0.02)}]}]
+        perf = review.rule_performance(cases, horizon=5)
+        self.assertEqual(perf["R-004"]["n_decisions"], 1)
+        self.assertEqual(perf["R-004"]["n_evaluated"], 1)
+
+
+class TestRuleAttributionExcess(unittest.TestCase):
+    """準則的損益要能用相對基準的超額來看：大盤漲 4% 時賺 2% 的準則是落後，不是有效。"""
+
+    CASES = [{"date": "2026-09-14", "rules_applied": ["R-002"],
+              "orders": [{"code": "0052", "horizons": {5: {"return_adj": 0.038,
+                                                           "excess": -0.004}}},
+                         {"code": "0056", "horizons": {5: {"return_adj": 0.030,
+                                                           "excess": 0.010}}}]}]
+
+    def test_平均超額(self):
+        perf = review.rule_performance(self.CASES, horizon=5)
+        self.assertAlmostEqual(perf["R-002"]["avg_excess"], 0.003, places=6)
+
+    def test_超額為正的比例(self):
+        perf = review.rule_performance(self.CASES, horizon=5)
+        self.assertAlmostEqual(perf["R-002"]["excess_win_rate"], 0.5, places=6)
+
+    def test_沒有基準資料時超額為_None(self):
+        cases = [{"date": "2026-09-14", "rules_applied": ["R-002"],
+                  "orders": [{"code": "0052", "horizons": {5: {"return_adj": 0.038}}}]}]
+        perf = review.rule_performance(cases, horizon=5)
+        self.assertIsNone(perf["R-002"]["avg_excess"])
+        self.assertIsNone(perf["R-002"]["excess_win_rate"])
+        self.assertAlmostEqual(perf["R-002"]["avg_return"], 0.038, places=6)
+
+    def test_歸因表印出超額(self):
+        perf = review.rule_performance(self.CASES, horizon=5)
+        text = review.render([], perf, 5)
+        self.assertIn("平均超額", text)
+        self.assertIn("+0.30%", text)
+
+
+class TestRenderOrderRules(unittest.TestCase):
+    def test_案例的每筆單印出它引用的準則(self):
+        d = decision("2026-09-29", rules_applied=["R-002"],
+                     orders=[order("0056", rules_applied=["R-002", "R-004"])])
+        cases = review.cases_from([d], {"orders": [], "adherence": {"days": []}},
+                                  None, None)
+        text = review.render(cases, {}, 5)
+        self.assertIn("準則　R-002、R-004", text)
+
+
 class TestExecLabel(unittest.TestCase):
     """`no_fill` 不等於「沒成交」——當日複盤時多半只是還沒對回（成交對回要等
     隔日 settle）。印成「未成交」會讓複盤誤判委託失敗，那是危險的誤讀。"""
@@ -316,5 +408,78 @@ class TestDefaultWindow(unittest.TestCase):
                          ("2026-08-27", "2026-09-02"))
 
 
+class TestContextSatellite(unittest.TestCase):
+    def test_脈絡含個股桶閘門與減碼候選(self):
+        env = {"core": {"ratio_band": {"action": "hold"}}, "breaker": {"level": "none"},
+               "satellite": {"gates": {"name_cap": 0.12}, "trim_candidates": [{"code": "2308"}],
+                             "candidates_source": "api/st/10"}}
+        pk = {"ark": {"posture": {}, "layout": {"rows": {}}}, "discipline": {},
+              "industry": {"candidates": {"6274": {}, "2330": {}}}}
+        ctx = review.build_context(pk, env)
+        self.assertEqual(ctx["satellite"]["gates"], {"name_cap": 0.12})
+        self.assertEqual(ctx["satellite"]["trim_candidates"], ["2308"])
+        self.assertEqual(ctx["satellite"]["candidates_n"], 2)
+
+
+class TestSatelliteEvaluatedLine(unittest.TestCase):
+    """複盤層要據此決定閘門動不動，所以筆數得在報告第一行，不能埋在段落裡。"""
+
+    def test_有已評筆數(self):
+        report = {"satellite": {"horizons": {5: {"evaluated": 3}}}}
+        self.assertEqual(review.satellite_evaluated_line(report),
+                         "個股桶 T+5 已評 3 筆（少於 5 筆時閘門維持不調）")
+
+    def test_JSON往返後鍵是字串也讀得到(self):
+        report = {"satellite": {"horizons": {"5": {"evaluated": 3}}}}
+        self.assertEqual(review.satellite_evaluated_line(report),
+                         "個股桶 T+5 已評 3 筆（少於 5 筆時閘門維持不調）")
+
+    def test_沒有個股桶段落時回0(self):
+        self.assertEqual(review.satellite_evaluated_line({}),
+                         "個股桶 T+5 已評 0 筆（少於 5 筆時閘門維持不調）")
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestFetchPrices(unittest.TestCase):
+    """抓 K 線失敗要有界：改用快取並標記不完整，連續失敗達上限就不再嘗試（10/02 逾時實錄）。"""
+
+    def run_fetch(self, fail_codes, max_failures=2):
+        attempts = []
+
+        def fetch(api, code, start, end):
+            attempts.append(code)
+            if code in fail_codes:
+                raise TimeoutError("Timeout Topic: api/v1/data/kbars")
+            return [{"date": "2026-10-08", "close": 1.0}]
+
+        def cache(code):
+            return [{"date": "2026-09-01", "close": 3.0}, {"date": "2026-10-07", "close": 2.0}]
+        prices, gaps = review.fetch_prices(None, ["0050", "2059", "2330", "6515"],
+                                           "2026-10-01", "2026-10-09", fetch=fetch,
+                                           load_cache=cache, max_failures=max_failures)
+        return prices, gaps, attempts
+
+    def test_失敗改用區間內快取並記缺口(self):
+        prices, gaps, _ = self.run_fetch({"2059"})
+        self.assertEqual(prices["2059"], [{"date": "2026-10-07", "close": 2.0}])
+        self.assertEqual(set(gaps), {"2059"})
+        self.assertEqual(prices["2330"], [{"date": "2026-10-08", "close": 1.0}])
+
+    def test_連續失敗達上限後不再嘗試(self):
+        prices, gaps, attempts = self.run_fetch({"2059", "2330", "6515"})
+        self.assertEqual(attempts, ["0050", "2059", "2330"])
+        self.assertEqual(set(gaps), {"2059", "2330", "6515"})
+        self.assertIn("未嘗試", gaps["6515"])
+
+    def test_全部成功沒有缺口(self):
+        _, gaps, _ = self.run_fetch(set())
+        self.assertEqual(gaps, {})
+
+    def test_缺口說明不把快取當完整績效(self):
+        self.assertEqual(review.price_gaps_line({}), "")
+        line = review.price_gaps_line({"2059": "抓取失敗：Timeout"})
+        for needle in ("不完整", "快取", "2059", "pending"):
+            self.assertIn(needle, line)

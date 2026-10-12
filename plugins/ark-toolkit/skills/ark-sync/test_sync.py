@@ -396,6 +396,13 @@ class TestPostureCash(unittest.TestCase):
         settle = {"today": 0.0, "t1": -99999.0, "t2": 0.0}
         self.assertEqual(sync.posture_cash(1000.0, settle, 0.0), 0.0)
 
+    def test_今日交割款不重複計入(self):
+        """今日交割款在交割日當天已進了券商餘額，再加一次就是同一筆錢算兩次。
+        2026-09-24 實測：餘額 55,828 已含當日入帳的賣出款 33,893，現金欄卻被寫成
+        80,560，總資源虛增 17%"""
+        settle = {"today": 33893.0, "t1": -9161.0, "t2": 0.0}
+        self.assertEqual(sync.posture_cash(55828.0, settle, 0.0), 46667.0)
+
 
 class TestCashStepWhenNoChanges(unittest.TestCase):
     """庫存無變更時仍要不要同步現金。
@@ -434,17 +441,23 @@ class FakeAx:
     """
     PAGES = {"watchlist": {"自選", "運算", "調節 庫存", "布局 自選"},
              "posture": {"自選", "運算", "風控 運算"},
-             "splash": set()}                      # 冷啟動過場：什麼地標都沒有
+             "splash": set(),                      # 冷啟動過場：什麼地標都沒有
+             "popup": {"下次再說", "立即前往"},     # 冷啟後的公告彈窗：沒有 tab bar
+             "login": {"會員登入", "FB帳號登入"}}   # session 過期被登出：沒有 tab bar
 
     def __init__(self, page="posture", press_effective=True,
                  click_effective=True, restart_fixes=False,
-                 press_needs_scroll=False, splash_polls=0):
+                 press_needs_scroll=False, splash_polls=0,
+                 after_splash="watchlist", restart_dead_presses=0):
         self.page = page
+        self.after_splash = after_splash           # 過場畫面之後落在哪一頁
         self.splash_polls = splash_polls           # 重啟後要輪詢幾次 window() 才過完過場
         self.press_effective = press_effective
         self.click_effective = click_effective
         self.restart_fixes = restart_fixes
         self.press_needs_scroll = press_needs_scroll
+        self.restart_dead_presses = restart_dead_presses   # 重啟後頭幾次 press 仍無效
+        self.dead_presses_left = 0
         self.restarted = False
         self.clicks = []
         self.performed = []
@@ -454,7 +467,7 @@ class FakeAx:
         if self.page == "splash":
             self.splash_polls -= 1
             if self.splash_polls <= 0:
-                self.page = "watchlist"
+                self.page = self.after_splash
         return self.page
 
     def by_desc(self, w, text):
@@ -467,6 +480,8 @@ class FakeAx:
             self.page = "watchlist"
         elif name == "運算":
             self.page = "posture"
+        elif name == "下次再說":
+            self.page = "watchlist"
 
     def perform(self, el, action):
         self.performed.append((el, action))
@@ -474,6 +489,9 @@ class FakeAx:
 
     def press(self, el):
         self._last_pressed = el
+        if self.dead_presses_left > 0:
+            self.dead_presses_left -= 1
+            return 0
         scrolled = (el, "AXScrollToVisible") in self.performed
         if self.press_effective and (scrolled or not self.press_needs_scroll):
             self._act(el)
@@ -492,10 +510,110 @@ class FakeAx:
 
     def restart_app(self):
         self.restarted = True
-        self.page = "splash" if self.splash_polls > 0 else "watchlist"
+        self.page = "splash" if self.splash_polls > 0 else self.after_splash
         if self.restart_fixes:
             self.press_effective = True
+            self.dead_presses_left = self.restart_dead_presses
         return 99
+
+
+class FakeEditAx:
+    """模擬編輯庫存頁的幾何（2026-10-05 實測）：ARK 視窗 x162 y259 288×545，
+    0052 是最後一列，按鈕 y717–754，貼著底部 tab bar；AXPress 在這裡落空。
+    往下翻一頁（已近列表尾端）只捲 137pt，0052 移到 y580 就按得下去。"""
+    WIN_POS, WIN_SIZE = (162.0, 259.0), (288.0, 545.0)
+    BTN_H, PAGE_SHIFT = 37.0, 137.0
+    DEAD_ZONE_TOP = 754.0           # 按鈕底邊超過這裡就被 tab bar 區吃掉
+
+    def __init__(self, tops, pages_down=1):
+        self.tops = dict(tops)      # 代號 -> 編輯鈕頂端 y
+        self.pages_down = pages_down
+        self.popup = False
+        self.performed = []
+
+    def window(self, pid):
+        return "win"
+
+    def _visible(self, code):
+        top = self.tops[code]
+        return top + self.BTN_H > self.WIN_POS[1] and top < self.WIN_POS[1] + self.WIN_SIZE[1]
+
+    def descs(self, w, role=None):
+        return [(("label", c), f"名{c}, {c}, 現股, 10, 50.0")
+                for c in self.tops if self._visible(c)]
+
+    def attr(self, el, name):
+        kind, code = el
+        if kind == "label" and name == "AXParent":
+            return ("row", code)
+        if kind == "row" and name == "AXChildren":
+            return [("btn", code)]
+        if kind == "btn" and name == "AXRole":
+            return "AXButton"
+        return None
+
+    def perform(self, el, action):
+        self.performed.append(action)
+        if action == "AXScrollDownByPage" and self.pages_down > 0:
+            self.pages_down -= 1
+            self.tops = {c: y - self.PAGE_SHIFT for c, y in self.tops.items()}
+        return 0
+
+    def point(self, el):
+        return self.WIN_POS if el == "win" else (200.0, self.tops[el[1]])
+
+    def size(self, el):
+        return self.WIN_SIZE if el == "win" else (40.0, self.BTN_H)
+
+    def press(self, el):
+        if el[0] == "btn" and self.tops[el[1]] + self.BTN_H < self.DEAD_ZONE_TOP:
+            self.popup = True
+        return 0
+
+    def by_desc(self, w, text):
+        return ["EL:編輯持股"] if text == "編輯持股" and self.popup else []
+
+
+class TestRowNearBottom(unittest.TestCase):
+    """目標列貼著視窗底部（tab bar）時 AXPress 會落空，要再捲一頁才按。"""
+    WIN = (259.0, 545.0)            # (top, height)
+
+    def test_實測貼底的0052要再捲(self):
+        self.assertTrue(sync.row_near_bottom(717.0, 37.0, *self.WIN))
+
+    def test_實測捲一頁後的0052可以按(self):
+        self.assertFalse(sync.row_near_bottom(580.0, 37.0, *self.WIN))
+
+    def test_畫面中段的列不必捲(self):
+        self.assertFalse(sync.row_near_bottom(400.0, 37.0, *self.WIN))
+
+
+class TestScrollToRowClearOfBottom(unittest.TestCase):
+    def setUp(self):
+        from unittest import mock
+        patcher = mock.patch("time.sleep")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_找到的列貼底時再往下捲一頁(self):
+        fake = FakeEditAx({"0050": 280.0, "0056": 500.0, "0052": 717.0})
+        self.assertTrue(sync.scroll_to_row(fake, 1, "0052"))
+        self.assertIn("AXScrollDownByPage", fake.performed)
+        self.assertEqual(fake.tops["0052"], 580.0)
+
+    def test_列不貼底時不多捲(self):
+        fake = FakeEditAx({"0050": 280.0, "0056": 500.0, "0052": 717.0})
+        self.assertTrue(sync.scroll_to_row(fake, 1, "0056"))
+        self.assertNotIn("AXScrollDownByPage", fake.performed)
+
+    def test_update_holding_一開始就看得到但貼底的列_先捲開再按(self):
+        # 2026-10-05：0052 本來就在畫面上，update_holding 跳過 scroll_to_row 直接按 → 落空
+        from unittest import mock
+        fake = FakeEditAx({"0050": 280.0, "0056": 500.0, "0052": 717.0})
+        with mock.patch.object(sync, "_fill"), \
+             mock.patch.object(sync, "_verify_and_save", return_value=True):
+            self.assertTrue(sync.update_holding(fake, 1, "0052", 112, 65.0))
+        self.assertTrue(fake.popup)
 
 
 class TestStrategyRowParsing(unittest.TestCase):
@@ -579,8 +697,16 @@ class TestEnsureResponsive(unittest.TestCase):
     def test_重啟仍無效則報錯(self):
         fake = FakeAx(press_effective=False, click_effective=False)
         with self.assertRaises(RuntimeError):
-            ark.ensure_responsive(fake, 1, probe_timeout=0.05)
+            ark.ensure_responsive(fake, 1, probe_timeout=0.05, ready_timeout=0.3)
         self.assertTrue(fake.restarted)            # 有試過重啟才放棄
+
+    def test_冷啟公告彈窗先按掉再探測_不誤判殭屍態(self):
+        # 2026-09-09／09-10 實錄：App 冷啟後停在「下次再說／立即前往」公告視窗，沒有 tab bar，
+        # probe 找不到「自選」也找不到「back」→ 判殭屍態 → 重啟 → 又是同一個彈窗，循環兩次
+        fake = FakeAx(page="popup")
+        pid = ark.ensure_responsive(fake, 1, probe_timeout=0.05)
+        self.assertEqual(pid, 1)
+        self.assertFalse(fake.restarted)
 
     def test_重啟後過場畫面沒有tab_bar時要等而不是立刻判死(self):
         # 2026-09-02 實錄：restart_app 在 AXWindows 一讀得到就回來，此時還是過場畫面，
@@ -591,6 +717,44 @@ class TestEnsureResponsive(unittest.TestCase):
         with mock.patch("time.sleep"):
             pid = ark.ensure_responsive(fake, 1, probe_timeout=0.05)
         self.assertEqual(pid, 99)
+
+    def test_重啟後tab_bar已出現但事件層還沒活_要重試探測而不是試一次就判死(self):
+        # 2026-10-05 10:00 實錄：重啟 → tab bar 很快出現 → 唯一一次 probe 失敗 →
+        # 「重啟後仍無效」，全程 13 秒；事後 App 好端端停在運算頁
+        fake = FakeAx(press_effective=False, click_effective=False,
+                      restart_fixes=True, restart_dead_presses=1)
+        pid = ark.ensure_responsive(fake, 1, probe_timeout=0.05)
+        self.assertEqual(pid, 99)
+
+    def test_重啟後探測途中App消失_報ArkNotRunning不混成無回應(self):
+        class Gone(FakeAx):
+            ArkNotRunning = type("ArkNotRunning", (RuntimeError,), {})
+
+            def window(self, pid):
+                if self.restarted:
+                    self.polls_after_restart = getattr(self, "polls_after_restart", 0) + 1
+                    if self.polls_after_restart > 1:      # tab bar 看到一眼後就不見
+                        raise self.ArkNotRunning("ARK 不在")
+                return super().window(pid)
+
+        fake = Gone(press_effective=False, click_effective=False)
+        with self.assertRaises(Gone.ArkNotRunning):
+            ark.ensure_responsive(fake, 1, probe_timeout=0.05, ready_timeout=0.3)
+
+    def test_停在登入頁直接報已登出_不重啟(self):
+        # 2026-09-27 實錄：連假後 session 過期，App 停在登入頁，沒有 tab bar 也沒有 back，
+        # 被當成殭屍態重啟再空等 90 秒，最後報的是「等待逾時：重啟後 tab bar 出現」
+        fake = FakeAx(page="login")
+        with self.assertRaises(ark.ArkLoggedOut):
+            ark.ensure_responsive(fake, 1, probe_timeout=0.05)
+        self.assertFalse(fake.restarted)
+
+    def test_冷啟過場後落在登入頁_立刻報已登出不等到逾時(self):
+        from unittest import mock
+        fake = FakeAx(page="splash", splash_polls=3, after_splash="login")
+        with mock.patch("time.sleep"):
+            with self.assertRaises(ark.ArkLoggedOut):
+                ark.ensure_responsive(fake, 1, probe_timeout=0.05)
 
 
 SHIOAJI_CFG = {"version": 2, "accounts": [{"type": "shioaji", "name": "永豐"}]}
@@ -662,9 +826,10 @@ class FakePostureAx:
     POS, SIZE = (35.0, 293.0), (288.0, 545.0)
     HIDDEN_Y, VISIBLE_Y = 166.0, 370.0
 
-    def __init__(self, value="88,347", at_top=False):
+    def __init__(self, value="88,347", at_top=False, in_front=True):
         self.value = value
         self.at_top = at_top
+        self.in_front = in_front                    # False＝ARK 視窗被別的視窗蓋住
         self.keypad_open = False
         self.buffer = ""
         self.events = []
@@ -706,10 +871,15 @@ class FakePostureAx:
             self.buffer = self.value.replace(",", "")
         return 0
 
+    def activate(self, timeout=10.0):
+        self.events.append(("activate",))
+        self.in_front = True
+        return 0
+
     def click(self, x, y):
         self.events.append(("click", (x, y)))
-        if not self.keypad_open:
-            return                                  # 沒鍵盤：點到別的東西，欄位不動
+        if not self.keypad_open or not self.in_front:
+            return                                  # 沒鍵盤或被蓋住：點到別的東西，欄位不動
         for row in ark.KEYPAD_KEYS:
             for key in row:
                 kx, ky = ark.keypad_point(self.POS, self.SIZE, key)
@@ -747,6 +917,49 @@ class TestWritePostureCashScroll(unittest.TestCase):
         fake = FakePostureAx(at_top=True)
         self.assertTrue(self._write(fake, 81727.0))
         self.assertEqual(fake.value, "81,727")
+
+    def test_被其他視窗蓋住時先帶到前景再點(self):
+        # 2026-09-28 實錄：ARK 視窗被另一個 App 的視窗蓋住，座標點擊（全域滑鼠事件）
+        # 全落在那個視窗上，現金欄維持原值、對帳回報失敗；帶到前景後同一支一次寫入
+        fake = FakePostureAx(at_top=True, in_front=False)
+        self.assertTrue(self._write(fake, 37485.0))
+        self.assertEqual(fake.value, "37,485")
+        first_click = next(i for i, e in enumerate(fake.events) if e[0] == "click")
+        self.assertLess(fake.events.index(("activate",)), first_click)
+
+
+class TestScrollWaitsForSettledScreen(unittest.TestCase):
+    """翻頁動畫中途 AX tree 只暴露兩三列；那時收集會跳過整段列。
+
+    2026-10-10 實機：17 檔只讀到 13～14 檔（漏 00935、00894、2345、2383），
+    中間兩屏各只讀到 2～3 檔。翻頁後等畫面靜止再收集就 17/17。
+    """
+
+    SCREENS = [("A", "B", "C"), ("C", "D", "E"), ("E", "F", "G"), ("E", "F", "G")]
+
+    def setUp(self):
+        self.page, self.reads_since_step = 0, 0
+        self._sleep, ark.time.sleep = ark.time.sleep, lambda s: None
+
+    def tearDown(self):
+        ark.time.sleep = self._sleep
+
+    def screen(self):
+        self.reads_since_step += 1
+        if self.reads_since_step <= 2:                 # 動畫中途：只看得到最後一列
+            return self.SCREENS[self.page][-1:]
+        return self.SCREENS[self.page]
+
+    def step(self):
+        self.page = min(self.page + 1, len(self.SCREENS) - 1)
+        self.reads_since_step = 0
+
+    def test_每屏等靜止後才收集_不漏列(self):
+        self.reads_since_step = 99                     # 起始畫面已靜止
+        found = set()
+        ark._scroll_until_stable(self.step, self.screen,
+                                 lambda: found.update(self.screen()), max_rounds=10)
+        self.assertEqual(found, set("ABCDEFG"))
 
 
 if __name__ == "__main__":
@@ -1144,3 +1357,34 @@ class TestCrossCheckWithServer(unittest.TestCase):
         ok, msg = sync.cross_check({"0050": (53, 106.28)}, None)
         self.assertTrue(ok)
         self.assertIsNone(msg)
+
+
+class TestWaitFor(unittest.TestCase):
+    """背景操作下 ax.window() 會瞬間讀不到視窗（AXWindows 與 AXMainWindow 同時回空，
+    2026-09-07 兩次 packet 各在不同步驟因此中斷）。輪詢期間要當成「還沒好」繼續等，
+    只有到期仍讀不到才拋——而且拋的是 ArkNotRunning，讓上層分得出 App 不在與畫面沒到。"""
+
+    class FlakyAx(FakeAx):
+        class ArkNotRunning(RuntimeError):
+            pass
+
+        def __init__(self, missing_polls, **kw):
+            super().__init__(**kw)
+            self.missing_polls = missing_polls
+
+        def window(self, pid):
+            if self.missing_polls > 0:
+                self.missing_polls -= 1
+                raise self.ArkNotRunning("讀不到 ARK 視窗")
+            return super().window(pid)
+
+    def test_瞬間讀不到視窗要繼續等(self):
+        fake = self.FlakyAx(missing_polls=2, page="watchlist")
+        w = ark.wait_for(fake, 1, lambda w: bool(fake.by_desc(w, "自選")), "回主頁",
+                         timeout=2.0)
+        self.assertEqual(w, "watchlist")
+
+    def test_到期仍讀不到視窗拋ArkNotRunning(self):
+        fake = self.FlakyAx(missing_polls=10_000, page="watchlist")
+        with self.assertRaises(self.FlakyAx.ArkNotRunning):
+            ark.wait_for(fake, 1, lambda w: True, "回主頁", timeout=0.05)

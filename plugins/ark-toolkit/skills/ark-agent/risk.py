@@ -23,6 +23,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..", "..", "lib")))
 
 import equity   # noqa: E402
+import gates as gates_mod   # noqa: E402
 import tracks   # noqa: E402
 
 EXITS = os.path.expanduser("~/.ark-toolkit/agent/satellite_exits.jsonl")
@@ -47,6 +48,10 @@ DEFAULTS = {
     "satellite_stop_cooldown_days": 10,
     "breaker_l1": 0.08,
     "breaker_l2": 0.15,
+    # 個股桶「確認無燈號」必賣的適用範圍：off（預設，不強制）／all（整個個股桶）／
+    # 代號清單。這是使用者個人的出場判準，通用預設不替任何人開啟；個人設定走
+    # 環境變數 ARK_LAMP_EXIT（見 lamp_exit_scope_from_env）。
+    "lamp_exit_scope": "off",
 }
 
 
@@ -161,6 +166,137 @@ def satellite_cooldown(exits, streak_cap, cooldown_days, calendar, today):
             until)
 
 
+# ---------------------------------------------------------------- 個股桶
+
+def satellite_quota(total, suggested_ratio, share, fallback_ratio):
+    """個股桶配額＝總資源 × ARK 建議持股比 × 佔投入比。讀不到建議比例時退用固定比例
+    （舊制的 25%），不讓配額歸零——那會把減碼以外的動作全擋掉。"""
+    if suggested_ratio is None:
+        return total * fallback_ratio
+    return total * suggested_ratio / 100.0 * share
+
+
+def trim_candidates(resolved, total, name_cap, buffer):
+    """超過單檔上限加緩衝的個股桶部位，列出要減到多少。緩衝是參考值，決策層可提早減。"""
+    if not total:
+        return []
+    out = []
+    for code, r in resolved.items():
+        if r["track"] != tracks.SATELLITE:
+            continue
+        ratio = r["value"] / total
+        if ratio > name_cap + buffer:
+            out.append({"code": code, "ratio": round(ratio, 4),
+                        "excess_value": r["value"] - name_cap * total,
+                        "target_value": name_cap * total})
+    return sorted(out, key=lambda x: -x["excess_value"])
+
+
+def satellite_allowlist(assigned, resolved, candidates):
+    """可以出現在個股桶委託裡的代號：ARK 候選 ∪ 目前持有的衛星軌 ∪ tracks.json 指定。
+    持有的一定要在——減碼與停損不能被白名單擋。"""
+    held = {c for c, r in resolved.items() if r["track"] == tracks.SATELLITE}
+    manual = {c for c, t in assigned.items() if t == tracks.SATELLITE}
+    return sorted(set(candidates or ()) | held | manual)
+
+
+def sector_exposure(resolved, sectors):
+    """衛星軌市值依產業加總；沒有產業別的代號自成一類（不擋，但也不與別檔合併）。"""
+    out = {}
+    for code, r in resolved.items():
+        if r["track"] != tracks.SATELLITE:
+            continue
+        key = sectors.get(code) or code
+        out[key] = out.get(key, 0.0) + r["value"]
+    return out
+
+
+# ---------------------------------------------------------------- 個股桶燈號
+
+VALUE_TAG, HEATING_TAG = "價值", "升溫"
+LAMP_VALUE_ONLY = "value_only"
+LAMP_VALUE_HEATING = "value_heating"
+LAMP_HEATING_ONLY = "heating_only"
+LAMP_NONE = "none"          # 已確認：價值＝否、升溫＝否
+LAMP_UNKNOWN = "unknown"    # 任何來源缺失或讀取失敗——缺值不等於無燈號
+
+
+def _flag(tag, row, zone_codes, code):
+    """單一燈號：任一來源亮就是 True；兩來源都完整且都沒亮才是 False；否則 None。"""
+    if (row is not None and tag in row["tiers"]) or (zone_codes is not None and code in zone_codes):
+        return True
+    if row is not None and zone_codes is not None:
+        return False
+    return None
+
+
+def _is_str_list(v):
+    return isinstance(v, (list, tuple)) and all(isinstance(x, str) for x in v)
+
+
+def _holding_row(h):
+    """持股列算「讀到位階」的條件：是物件、`suggest_qty` 是整數（位階與建議調節是
+    同一組可選欄位）、`tiers` 是字串清單。缺欄、None 或型別不對都是沒讀到，
+    不可退化成空清單——那會把未知誤判成確認無燈號。"""
+    if not isinstance(h, dict):
+        return None
+    qty, tiers = h.get("suggest_qty"), h.get("tiers")
+    if not isinstance(qty, int) or isinstance(qty, bool) or not _is_str_list(tiers):
+        return None
+    return {"tiers": list(tiers)}
+
+
+def _zone_codes(v):
+    """名單必須是字串清單；其餘（None、單一字串、物件）都當讀不到。"""
+    return list(v) if _is_str_list(v) else None
+
+
+def lamp_state(code, holdings, industry):
+    """持股的 ARK 燈號（價值／升溫），附來源，供個股桶出場判準使用。
+
+    兩個獨立來源：調節庫存列的位階欄（AX），與產業價值區／升溫區名單（API）。
+    位階欄與建議調節欄是同一組可選欄位（App 未算出建議時整組消失），所以
+    `suggest_qty` 為 None 的列不算「讀到位階」。名單讀取失敗或沒保存
+    （舊決策包沒有 `heating_codes`）也是未知。來源互相矛盾時以亮燈者為準，
+    絕不因此判成無燈號。
+    """
+    row = _holding_row((holdings or {}).get(code))
+    ind = industry if isinstance(industry, dict) else {}
+    ok = ind.get("error") is None
+    value_codes = _zone_codes(ind.get("value_codes")) if ok else None
+    heating_codes = _zone_codes(ind.get("heating_codes")) if ok else None
+    value = _flag(VALUE_TAG, row, value_codes, code)
+    heating = _flag(HEATING_TAG, row, heating_codes, code)
+    if value is None or heating is None:
+        state = LAMP_UNKNOWN
+    elif value:
+        state = LAMP_VALUE_HEATING if heating else LAMP_VALUE_ONLY
+    else:
+        state = LAMP_HEATING_ONLY if heating else LAMP_NONE
+    return {"state": state, "value": value, "heating": heating,
+            "sources": {"holding_row": row is not None,
+                        "zone_lists": value_codes is not None and heating_codes is not None}}
+
+
+def lamp_exit_scope_from_env(env=None):
+    """ARK_LAMP_EXIT：空或 off＝不強制；all＝整個個股桶；其餘為逗號分隔代號。"""
+    raw = ((env if env is not None else os.environ).get("ARK_LAMP_EXIT") or "").strip()
+    if raw.lower() in ("", "off"):
+        return "off"
+    if raw.lower() == "all":
+        return "all"
+    return sorted({c.strip() for c in raw.split(",") if c.strip()})
+
+
+def lamp_exits(lamps, positions, scope):
+    """確認無燈號且在適用範圍內的個股桶部位 → 必須整筆賣出。未知一律不列入。"""
+    if scope == "off":
+        return []
+    return [{"code": c, "qty": positions[c]["qty"]} for c, lamp in sorted(lamps.items())
+            if lamp["state"] == LAMP_NONE and c in positions
+            and (scope == "all" or c in scope)]
+
+
 # ---------------------------------------------------------------- 金額上限
 
 def _est_value(order, quotes):
@@ -191,7 +327,10 @@ def order_caps_violations(orders, quotes, limits):
             if value > limits["per_order_cap"]:
                 out.append(f"{o['code']} 單筆 {value:,.0f} 超過上限 "
                            f"{limits['per_order_cap']:,.0f}")
-        if value < limits["min_trade_value"]:
+        # 凍結軌就是「低於最小金額」的部位，清倉必然低於門檻——journal 已驗過
+        # 它是整筆清掉，這裡不再擋，否則碎片永遠出不了場
+        if value < limits["min_trade_value"] and not (
+                o["action"] == "sell" and o.get("track") == tracks.FROZEN):
             out.append(f"{o['code']} 金額 {value:,.0f} 低於最小可交易金額 "
                        f"{limits['min_trade_value']:,.0f}（成本佔比過高）")
     if buy_total > limits["daily_buy_cap"]:
@@ -219,7 +358,7 @@ def total_resource(packet):
 
 
 def build_envelope(packet, assigned, equity_points, satellite_exits, calendar,
-                   today, effective_max_names, max_names_history, config):
+                   today, effective_max_names, max_names_history, config, gates=None):
     """把決策包＋軌道＋淨值史合成執行邊界。
 
     `blocks` 非空代表有東西被擋住；`can_buy` / `can_sell` 是最終結論，
@@ -255,9 +394,19 @@ def build_envelope(packet, assigned, equity_points, satellite_exits, calendar,
                       "紀律邊界會退化成現金為零、不需調節")
 
     facts_ok = sync_ok and posture is not None
-    quota = total * config["satellite_quota_ratio"]
     actual_ratio = (stock_value / total * 100) if total else 0.0
     suggested = (posture or {}).get("suggested_ratio")
+
+    g = gates or {}
+    industry = packet.get("industry") or {}
+    sectors = industry.get("sectors", {})
+    stop_loss = g.get("stop_loss", config["satellite_stop_loss"])
+    holdings = packet.get("ark", {}).get("holdings", {})
+    lamps = {c: lamp_state(c, holdings, industry) for c, r in sorted(resolved.items())
+             if r["track"] == tracks.SATELLITE}
+    quota = (satellite_quota(total, suggested, g["share_of_invested"],
+                             config["satellite_quota_ratio"])
+             if g else total * config["satellite_quota_ratio"])
 
     return {
         "schema": 1,
@@ -280,10 +429,12 @@ def build_envelope(packet, assigned, equity_points, satellite_exits, calendar,
                                "remaining": quota - agg[tracks.SATELLITE]["value"],
                                "halted": halted, "halt_reason": reason,
                                "halted_until": until,
-                               # 白名單取自「指定」而非「持倉」：還沒買的標的
-                               # 不在持倉裡，但開新倉必須先有人把它寫進 tracks.json
-                               "allowlist": sorted(c for c, t in assigned.items()
-                                                   if t == tracks.SATELLITE)},
+                               # 白名單＝ARK 候選 ∪ 目前持有的衛星軌 ∪ tracks.json 指定：
+                               # 新倉由當日 ARK 候選供應（成交後 settle 自動寫進
+                               # tracks.json），tracks.json 指定是人給的例外；持有的
+                               # 一定要在，減碼與停損不能被白名單擋
+                               "allowlist": satellite_allowlist(
+                                   assigned, resolved, industry.get("candidates"))},
             tracks.INHERITED: {**agg[tracks.INHERITED],
                                "unfreezable": sorted(c for c, r in resolved.items()
                                                      if r["unfreezable"])},
@@ -312,9 +463,22 @@ def build_envelope(packet, assigned, equity_points, satellite_exits, calendar,
             },
         },
         "satellite": {
-            "stop_loss": config["satellite_stop_loss"],
-            "candidates": stop_loss_candidates(resolved, positions,
-                                               config["satellite_stop_loss"]),
+            "stop_loss": stop_loss,
+            "candidates": stop_loss_candidates(resolved, positions, stop_loss),
+            "gates": {k: g[k] for k in gates_mod.BOUNDS} if g else None,
+            "name_cap_value": total * g["name_cap"] if g else None,
+            "sector_cap_value": total * g["sector_cap"] if g else None,
+            "sectors": sectors,
+            "sector_exposure": sector_exposure(resolved, sectors),
+            "trim_candidates": (trim_candidates(resolved, total, g["name_cap"], g["trim_buffer"])
+                                if g else []),
+            "candidates_source": industry.get("source"),
+            "candidates_error": industry.get("error"),
+            # 燈號一律算出來（未知與確認無燈號分開）；必賣只在使用者設定的範圍內
+            "lamps": lamps,
+            "lamps_as_of": packet.get("generated_at"),
+            "lamp_exit_scope": config.get("lamp_exit_scope", "off"),
+            "lamp_exits": lamp_exits(lamps, positions, config.get("lamp_exit_scope", "off")),
         },
     }
 
@@ -373,6 +537,14 @@ def max_names_history(directory=ENVELOPE_DIR):
     return raws, effective
 
 
+def load_gates_or_defaults(path=None):
+    """讀閘門檔；壞掉就退回預設並回一則警告——閘門寫錯不該讓整條決策軌停擺。"""
+    try:
+        return gates_mod.load(path), None
+    except ValueError as e:
+        return dict(gates_mod.DEFAULTS), f"gates.json 無效，改用預設閘門：{e}"
+
+
 def main():
     import market
     import packet as packet_mod
@@ -391,13 +563,17 @@ def main():
     # 日曆走本地日K快取，不連線——風控不該因為網路而算不出來
     calendar = [b["date"] for b in market.load_cache(packet_mod.BENCHMARK)]
     past_raws, effective = max_names_history()
+    gates_cfg, gates_warning = load_gates_or_defaults()
 
     env = build_envelope(packet=pk, assigned=tracks.load(),
                          equity_points=equity.load_points(),
                          satellite_exits=load_exits(), calendar=calendar, today=date,
                          effective_max_names=effective,
                          max_names_history=past_raws + [pk["discipline"]["max_names"]],
-                         config=DEFAULTS)
+                         config={**DEFAULTS, "lamp_exit_scope": lamp_exit_scope_from_env()},
+                         gates=gates_cfg)
+    if gates_warning:
+        env["warnings"] = [gates_warning]
     path = save_envelope(env)
 
     if args.json:
@@ -409,8 +585,16 @@ def main():
               f"｜可買 {env['can_buy']}｜可賣 {env['can_sell']}")
         print(f"   衛星軌 {s['value']:,.0f} / 配額 {s['quota']:,.0f}"
               f"（剩 {s['remaining']:,.0f}）{'　⛔ 冷卻中' if s['halted'] else ''}")
+        sat = env["satellite"]
+        if sat.get("trim_candidates"):
+            print("   ⚠️ 超限減碼候選：" + "、".join(
+                f"{c['code']} {c['ratio']:.1%}→{c['target_value']:,.0f}" for c in sat["trim_candidates"]))
+        if sat.get("candidates_error"):
+            print(f"   ⚠️ 個股桶候選池讀取失敗：{sat['candidates_error']}")
         for b in env["blocks"]:
             print(f"   ⚠️ {b}")
+        if gates_warning:
+            print(f"   ⚠️ {gates_warning}")
     # 3 = 今天完全不能動（正常結果，非錯誤）；2 = 產不出邊界（錯誤）
     return 3 if is_fully_blocked(env) else 0
 

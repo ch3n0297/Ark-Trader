@@ -1,6 +1,6 @@
 ---
 name: ark-agent
-description: 自動交易決策軌：盤中產生決策包、Agent 依 ARK 紀律做出買賣決策並鎖定、自動下單、成交對回、滾動評估。當使用者說「跑今天的決策」「產生決策包」「結算」「看評估成績」時使用。僅限 macOS。
+description: 自動交易決策軌：盤中產生決策包、Agent 依 ARK 紀律做出買賣決策並鎖定、自動下單、成交對回、滾動評估；也可由人觸發一場做完（對帳 → 決策送單 → 等成交 → 當日結算）。當使用者說「開始交易」「跑今天的決策」「產生決策包」「結算」「看評估成績」時使用。僅限 macOS。
 ---
 
 # ark-agent
@@ -49,6 +49,11 @@ description: 自動交易決策軌：盤中產生決策包、Agent 依 ARK 紀�
   運算機的檔數不受影響
 - **調節＝賣出側**：挑幾檔把調節金額加總**覆蓋運算頁「參考調節金額」**即可，
   不必每檔照做；**獲利才調節**（虧損賣出侵蝕本金，App 紀律不做）；升溫區優先
+- 個股桶燈號：`envelope.satellite.lamps` 依兩個來源（調節庫存列位階、產業價值區／升溫區名單）
+  判 `value_only`／`value_heating`／`heating_only`／`none`／`unknown`；任一來源缺失即 `unknown`
+  ——缺值不等於無燈號。`ARK_LAMP_EXIT`（`all` 或逗號分隔代號；預設不設＝關閉）開啟後，
+  範圍內「確認無燈號」的部位列入 `lamp_exits`，journal 要求整筆賣出
+- 國定假日：packet 先查基準當日行情，休市離開碼 3，daily 視為今日不交易
 - **布局＝買進側**：只挑價值區標的
 - **App 顯示參考調節（>0）時，先調節才可買**
 
@@ -92,6 +97,12 @@ uv run skills/ark-agent/dividends.py         # 3. 除權息資料（報酬校正
 uv run skills/ark-sync/sync.py --allow-delete --with-cash   # 4. 庫存與現金同步回 ARK
 uv run skills/ark-agent/record_return.py     # 5. 當日已實現獲利記進離職倒數（僅獲利日）
 
+# 不用排程、由人說「開始交易」才動：一場做完（盤中 09:00–13:00 開始）
+uv run skills/ark-agent/daily.py trade       # 對帳統一（sync --with-cash）→ 決策執行五步
+#                                              → execute --wait 30（等成交，逾時刪單並記 cancel）
+#                                              → 當日結算五步（journal settle --same-day 起）
+#                                              當日已有決策即拒絕；--wait 可調等待分鐘
+
 # 週五 15:00 複盤（daily.py review 依序跑：案例 → 複盤層 → 驗準則檔 → commit）
 uv run skills/ark-agent/review.py --out ~/.ark-toolkit/agent/reviews/<date>.txt
 #                                              ★ 複盤層讀案例 → 寫檢討記錄、更新準則檔
@@ -100,6 +111,41 @@ uv run skills/ark-agent/review.py --out ~/.ark-toolkit/agent/reviews/<date>.txt
 # 隨時看成績
 uv run skills/ark-agent/evaluate.py          # --json 出機器格式；--offline 不連線
 ```
+
+`journal.py settle` 現在會寫 `satellite_exits.jsonl`（衛星軌停損連續冷卻的依據），
+並把成交的個股桶買單自動指派進 `tracks.json` 的 satellite 軌；週五複盤可在
+`gates.py` 的區間與步幅內調整 `gates.json`，超出硬邊界由 `daily.py review` 自動還原。
+
+## 手動一場（使用者說「開始交易」）
+
+不用排程、由人觸發時走 `daily.py trade`。順序仍由程式寫死，你**只負責啟動、監看、回報**：
+不自己送單、不改 journal、不重跑第二場。
+
+1. **先看時間**：交易日 **09:00–13:00** 才能開始（留 30 分等單＋結算，13:30 收盤前做完）。
+   不在窗內就告訴使用者現在幾點、為什麼不跑；**不要**用 `ARK_FORCE_WINDOW` 繞過。
+2. **載入個人設定，防睡眠、背景執行**。個人化設定（`ARK_RULES`、`ARK_NAMES_FLOOR`、
+   `ARK_NAMES_CAP`、`ARK_DECISION_MODEL`、`ARK_BACKEND`、`ARK_LAMP_EXIT`）放 `~/.ark-toolkit/agent.env`，
+   有就 source；沒有就走 repo 預設（`ARK_BACKEND` 預設 simulation，不會誤動真錢）：
+
+   ```bash
+   [ -f ~/.ark-toolkit/agent.env ] && { set -a; source ~/.ark-toolkit/agent.env; set +a; }
+   caffeinate -dis uv run skills/ark-agent/daily.py trade      # --wait N 可改等待分鐘
+   ```
+
+   一場約 5–40 分（決策層約 5 分＋等成交最多 30 分），背景執行、輪詢 log。
+3. **監看** `~/.ark-toolkit/agent/daily.log` 尾段，三個檢查點：
+   - packet 摘要行「準則 N 條」須等於 `grep -c '^### R-' "$ARK_RULES"`
+     （未設時為 `~/.ark-toolkit/decision-rules.md`）；不等代表 env 沒載到，立刻 `pkill` 中止
+     ——這時決策尚未鎖定，重來不留痕
+   - envelope 行的熔斷等級與可買／可賣
+   - execute 每腿的最終狀態（`→ Filled` 或 `（已刪單）`）——那就是券商回報
+4. **結束後回報**：讀 journal 當日的 `decision`／`execution`／`cancel`／`fill` 記錄，列出每筆單
+   （動作、代號、股數、限價、成交價）、決策理由摘要、未成交或刪單的腿、結算五步有沒有哪步失敗。
+5. **`daily.py trade` 拒絕時**（當日已有決策、不在時窗、對帳同步失敗）那是正確行為，照實回報
+   原因，不要繞過。同日只認第一筆決策。
+
+`trade` 與 `decide`／`settle` 排程互斥：兩者都會做決策，同日第二筆會被 `trade` 拒絕、
+被排程標 `amended`。用 `trade` 就把排程 `launchctl bootout`＋`disable`。
 
 ## 排程安裝（launchd）
 
@@ -125,14 +171,15 @@ cat ~/.ark-toolkit/agent/launchd.check.out
 ## 軌道模型
 
 `~/.ark-toolkit/agent/tracks.json` 指定每個部位屬於哪一軌，決定它適用哪套規則。
-**軌道不自動推斷**——開新衛星標的必須有人手動寫進去。
+個股桶新倉由 ARK 候選供應，成交後 settle 自動寫進 tracks.json；`inherited`／`frozen`
+的例外仍由人手動指定。
 
 | 軌道 | ARK 紀律 | 停損 | 說明 |
 |---|---|---|---|
 | `core` | 完全適用 | 無 | 只做 ETF。預設軌，evaluate 只統計這一軌 |
-| `satellite` | **豁免** | **−12%** | 個股／產業／槓桿 ETF；配額 25%，需在 allowlist 內 |
+| `satellite` | **豁免** | 依 `gates.json`（起始 −12%） | 個股桶：候選來自 ARK 產業價值區（唯讀 API），配額＝總資源×建議持股比×佔投入比（起始 50%），單檔／同產業硬上限（起始 12%／25%），超限列減碼候選 |
 | `inherited` | — | — | 虧損中且 ARK 不可賣，凍結至轉正；**不佔衛星軌配額** |
-| `frozen` | — | — | 低於最小可交易金額，不進出場計算 |
+| `frozen` | — | — | 低於最小可交易金額，不進出場計算；已離開價值區的碎片可**整筆清掉**（不論盈虧，`track: "frozen"` 賣單） |
 
 **「先調節才可買」兩軌都適用**：那是 ARK 的帳戶級曝險訊號，若衛星軌能在被要求
 調節時加碼，帳戶總曝險就失控了。
@@ -159,14 +206,20 @@ CA 啟用失敗／`packet_hash` 不符／熔斷 L2 已觸發／當日已有決�
     {"action": "sell", "code": "0057", "qty": 76,
      "limit_low": 305.0, "limit_high": 310.0,
      "ark_basis": {"signal": "suggest_qty", "value": 76, "tiers": ["價值", "升溫"]},
+     "rules_applied": ["R-001"],
      "reason": "升溫且獲利，單檔即覆蓋參考調節金額的一半"}
   ],
   "rationale": "整體判斷理由，引用 posture.gap 與位階警示",
+  "rules_applied": ["R-001", "R-003"],
   "news_used": [{"code": "0057", "summary": "…", "source": "…"}]
 }
 ```
 
 無操作也要記：`"no_trade": true, "orders": []`——「今天不動」也是一筆決策。
+
+`rules_applied` 有兩層：委託上的只列決定了那筆單的準則，複盤據此逐筆歸因損益；
+決策層的是當天用到的全部（含沒產生委託的）。委託上沒有這個欄位的舊紀錄，複盤退回
+決策層清單。
 
 ## 鎖定機制
 
@@ -199,6 +252,7 @@ evaluate 只輸出點估計＋樣本數＋pending 筆數；60 日前瞻報酬要
 - `tracks.py` — 軌道歸屬（core／satellite／inherited／frozen），決定每個部位適用哪套規則
 - `equity.py` — 每日淨值曲線與熔斷判定（基準為歷史峰值，非期初本金）
 - `risk.py` — 風控層：熔斷、軌道配額、衛星軌停損、金額上限 → 執行邊界 envelope
+- `gates.py` — 個股桶閘門（預設、區間、步幅、檔案驗證）；閘門檔 gates.json 預設放在準則檔旁
 - `execute.py` — 下單層：股數→張數換算、價格檔位對齊、送出前檢查、`place_order`
 - `daily.py` — 每日編排（decide／settle／check），順序寫死；launchd 的進入點
 - `preflight.py` — 前置檢查（AX 權限、券商連線），無副作用只讀
@@ -209,12 +263,12 @@ evaluate 只輸出點估計＋樣本數＋pending 筆數；60 日前瞻報酬要
 - 委託路徑實機驗證在 **ark-start** skill（`skills/ark-start/verify.py`，寫死 simulation，
   碰不到真錢）——切 live 前先跑它
 - 持久化：`~/.ark-toolkit/agent/`（packets/、envelopes/、prices/、journal.jsonl、
-  equity.jsonl、tracks.json、satellite_exits.jsonl、dividends.jsonl）
+  equity.jsonl、tracks.json、satellite_exits.jsonl、dividends.jsonl、sectors.json）
 
 測試（純邏輯，不需要 ARK 或 Shioaji，任何平台可跑）：
 
 ```bash
-cd skills/ark-agent && PYTHONPATH=../../lib uv run --no-project --python 3.13 python -m unittest test_market test_packet test_journal test_evaluate test_risk test_tracks test_equity test_execute test_daily test_phase0 -v
+cd skills/ark-agent && PYTHONPATH=../../lib uv run --no-project --python 3.13 python -m unittest test_market test_packet test_journal test_evaluate test_risk test_tracks test_equity test_execute test_daily test_phase0 test_gates test_review -v
 ```
 
 ## 前置需求

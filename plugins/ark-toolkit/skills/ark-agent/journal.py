@@ -105,12 +105,13 @@ def is_leveraged_or_inverse(code):
     return code[:2] == "00" and code[-1:] in ("L", "R")
 
 
-def _validate_satellite(sat, envelope, quotes):
-    """衛星軌自己的規則：白名單、配額、冷卻。
+def _validate_satellite(sat, envelope, quotes, positions):
+    """衛星軌自己的規則：白名單、配額、冷卻、單檔／產業上限。
 
     ARK 紀律（獲利才賣、只買價值區、檔數）不套用在這裡——這一軌存在的理由
     就是做 ARK 不做的事（停損、非價值區標的）。但它不是法外之地：
-    標的必須有人先寫進 tracks.json，金額受配額限制。
+    白名單＝當日 ARK 產業價值區候選 ∪ 目前持有 ∪ tracks.json 指定，
+    金額受配額與單檔／產業上限限制。
     """
     if envelope is None:
         return ["有衛星軌委託但缺少執行邊界——查不到配額與白名單，不放行"]
@@ -120,10 +121,37 @@ def _validate_satellite(sat, envelope, quotes):
     for o in sat:
         if o["code"] not in allow:
             out.append(f"{o['code']} 不在衛星軌白名單內"
-                       f"（開新標的須先寫進 tracks.json）")
+                       f"（白名單＝當日 ARK 產業價值區候選 ∪ 目前持有 ∪ tracks.json 指定）")
     buys = [o for o in sat if o["action"] == "buy"]
+    # 對已歸他軌的持倉加碼＝把它偷偷搬進停損軌。換軌是人的決定，賣出不受影響。
+    for track in (INHERITED, CORE):
+        held = set(envelope["tracks"].get(track, {}).get("codes", ()))
+        for o in buys:
+            if o["code"] in held:
+                out.append(f"{o['code']} 目前歸 {track} 軌，個股桶不可對它加碼"
+                           f"（要換軌請改 tracks.json）")
     if buys and st.get("halted"):
         out.append(f"衛星軌冷卻中不可新倉：{st.get('halt_reason')}")
+    caps = envelope.get("satellite", {})
+    name_cap = caps.get("name_cap_value")
+    sector_cap = caps.get("sector_cap_value")
+    sectors = caps.get("sectors", {})
+    exposure = dict(caps.get("sector_exposure", {}))
+    after_by_code = {}
+    for o in buys:
+        value = o["qty"] * _est_price(o, quotes)
+        if o["code"] not in after_by_code:
+            held = positions.get(o["code"], {})
+            after_by_code[o["code"]] = (
+                held.get("qty", 0) * held.get("last_price", _est_price(o, quotes)))
+        after_by_code[o["code"]] += value
+        after = after_by_code[o["code"]]
+        if name_cap is not None and after > name_cap:
+            out.append(f"{o['code']} 買進後市值 {after:,.0f} 超過單檔上限 {name_cap:,.0f}")
+        key = sectors.get(o["code"]) or o["code"]
+        exposure[key] = exposure.get(key, 0.0) + value
+        if sector_cap is not None and exposure[key] > sector_cap:
+            out.append(f"{o['code']} 買進後「{key}」合計 {exposure[key]:,.0f} 超過產業上限 {sector_cap:,.0f}")
     net = (sum(o["qty"] * _est_price(o, quotes) for o in buys)
            - sum(o["qty"] * _est_price(o, quotes)
                  for o in sat if o["action"] == "sell"))
@@ -134,12 +162,62 @@ def _validate_satellite(sat, envelope, quotes):
     return out
 
 
+def _required_lamp_exits(sat, envelope):
+    """`envelope.satellite.lamp_exits`（確認無燈號、且在使用者設定的範圍內）必須整筆賣出。
+
+    範圍預設關閉，清單只在使用者開啟時出現；燈號未知的部位不會進清單。
+    不能賣的日子（L2 熔斷、事實不可信）不強制——那天本來就一筆都不能動。
+    """
+    if not envelope or not envelope.get("can_sell"):
+        return []
+    sold = {}
+    for o in sat:
+        if o["action"] == "sell":
+            sold[o["code"]] = sold.get(o["code"], 0) + o["qty"]
+    return [f"個股桶 {x['code']} 已確認無燈號（價值否、升溫否），依使用者出場判準必須整筆賣出："
+            f"持有 {x['qty']} 股，委託 {sold.get(x['code'], 0)} 股"
+            for x in envelope.get("satellite", {}).get("lamp_exits", ())
+            if sold.get(x["code"], 0) < x["qty"]]
+
+
+def _validate_frozen(frz, envelope, packet):
+    """凍結軌的出場規則：碎片部位（低於最小可交易金額）只准**整筆清掉**，
+    且該標的已不在 ARK 價值區。
+
+    這是對主軌「獲利才賣」的明示偏離（使用者 2026-09-07 決定）：碎片對集中與
+    分散都沒貢獻，留著只是帳面雜訊；但仍在價值區的碎片是 ARK 認為值得持有的，
+    照舊留著等回本。凍結軌不可買進——低於最小金額的部位要嘛清掉、要嘛加碼到
+    主軌，加碼走主軌規則。
+    """
+    if envelope is None:
+        return ["有凍結軌委託但缺少執行邊界——查不到凍結清單，不放行"]
+    frozen_codes = set(envelope["tracks"].get(FROZEN, {}).get("codes", ()))
+    positions = packet.get("account", {}).get("positions", {})
+    holdings = packet.get("ark", {}).get("holdings", {})
+    out = []
+    for o in frz:
+        code = o["code"]
+        if o["action"] != "sell":
+            out.append(f"凍結軌只能清倉，不可買進 {code}")
+            continue
+        if code not in frozen_codes:
+            out.append(f"{code} 不在凍結軌（envelope.tracks.frozen）")
+            continue
+        held = positions.get(code, {}).get("qty", 0)
+        if o["qty"] != held:
+            out.append(f"凍結軌 {code} 只准整筆清掉：持有 {held} 股，委託 {o['qty']} 股")
+        if "價值" in holdings.get(code, {}).get("tiers", []):
+            out.append(f"凍結軌 {code} 仍在 ARK 價值區，照主軌規則留著等回本")
+    return out
+
+
 def validate_orders(orders, packet, envelope=None):
     """硬規則驗證，回傳違規清單（空 = 合規）。
 
     主軌（core）＝「完全比照 ARK 紀律」，違反硬規則是 bug 不是自由度；
     自由度（賣哪幾檔、股數偏離、限價）不在這裡擋，事後由 evaluate 量測。
-    衛星軌（satellite）走 `_validate_satellite`，不受 ARK 紀律約束。
+    衛星軌（satellite）走 `_validate_satellite`，不受 ARK 紀律約束；
+    凍結軌（frozen）走 `_validate_frozen`，只准整筆清掉已離開價值區的碎片。
 
     **「先調節才可買」兩軌都適用**：那是 ARK 的帳戶級曝險訊號，若衛星軌能在
     被要求調節時加碼，帳戶總曝險就失控了。
@@ -150,8 +228,9 @@ def validate_orders(orders, packet, envelope=None):
     scope = set(packet.get("news_scope", {}).get("codes", []))
     core = [o for o in orders if track_of(o) == CORE]
     sat = [o for o in orders if track_of(o) == SATELLITE]
+    frz = [o for o in orders if track_of(o) == FROZEN]
     violations = [f"{o['code']} 的軌道不明：{track_of(o)!r}"
-                  for o in orders if track_of(o) not in (CORE, SATELLITE)]
+                  for o in orders if track_of(o) not in (CORE, SATELLITE, FROZEN)]
 
     # 資訊邊界是 ARK 實驗協定的一部分，只約束主軌；衛星軌以白名單為界
     for o in core:
@@ -166,7 +245,10 @@ def validate_orders(orders, packet, envelope=None):
             violations.append(f"買進 {o['code']} 違反主軌設定：槓桿／反向 ETF "
                               f"有波動耗損，不可放進沒有停損的主軌（衛星軌才行）")
     if sat:
-        violations += _validate_satellite(sat, envelope, quotes)
+        violations += _validate_satellite(sat, envelope, quotes, positions)
+    violations += _required_lamp_exits(sat, envelope)
+    if frz:
+        violations += _validate_frozen(frz, envelope, packet)
 
     buys = [o for o in orders if o["action"] == "buy"]
     sells = [o for o in orders if o["action"] == "sell"]
@@ -346,6 +428,65 @@ def match_fills(orders, pl_rows, positions_before, positions_after,
     return fills, unfilled
 
 
+def satellite_exits_from(decision, fills, before, stop_loss):
+    """個股桶賣單的出場紀錄：以決策包的原值均價算 roi，跌破停損標 stopped。
+    `risk.satellite_cooldown` 靠這份紀錄數連續停損——沒有寫入端它永遠不會生效。"""
+    filled = {(f["action"], f["code"]): f for f in fills}
+    out = []
+    for o in decision.get("orders", []):
+        if o.get("track") != SATELLITE or o["action"] != "sell":
+            continue
+        f = filled.get(("sell", o["code"]))
+        avg = before.get(o["code"], {}).get("avg_price")
+        if not f or not avg:
+            continue
+        roi = f["price"] / avg - 1
+        out.append({"date": decision.get("date"), "code": o["code"], "qty": f["qty"],
+                    "price": f["price"], "roi": round(roi, 6), "stopped": roi <= stop_loss})
+    return out
+
+
+def append_exits(records, path=None):
+    import risk
+    path = path or risk.EXITS
+    if not records:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:
+        for r in records:
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def satellite_assignments(decision, fills, assigned):
+    """成交的衛星軌買單，若代號尚未指派衛星軌則新增指派，回傳新的指派表。
+
+    個股桶會買 ARK 候選裡沒人寫進 tracks.json 的代號；`tracks.resolve` 對未指派
+    代號預設 core（無停損、套用 ARK 紀律）——沒有這道，填單成交後隔天就會被
+    當成主軌部位。沒有東西要加時回傳原物件（不複製），呼叫端可用來判斷是否
+    需要落地。"""
+    filled_buys = {f["code"] for f in fills if f.get("action") == "buy"}
+    out = assigned
+    for o in decision.get("orders", []):
+        if o.get("track") != SATELLITE or o.get("action") != "buy":
+            continue
+        code = o["code"]
+        # 只補「還沒人指定」的新倉。已歸別軌者由人改 tracks.json——自動搬軌會讓
+        # 「這筆為什麼被停損」變得無法解釋。
+        if code not in filled_buys or code in out:
+            continue
+        out = tracks.assign(out, code, SATELLITE)
+    return out
+
+
+def persist_satellite_assignments(decision, fills, path=None):
+    """`satellite_assignments` 的落地：讀現有 tracks.json，有新增才寫回。"""
+    path = path or tracks.TRACKS_PATH
+    assigned = tracks.load(path)
+    updated = satellite_assignments(decision, fills, assigned)
+    if updated is not assigned:
+        tracks.save(updated, path)
+
+
 def previous_weekday(date_iso):
     d = dt.date.fromisoformat(date_iso) - dt.timedelta(days=1)
     while d.weekday() >= 5:
@@ -354,46 +495,51 @@ def previous_weekday(date_iso):
 
 
 def settle_previous(api, today, path=JOURNAL, price_dir=None):
-    """結算前一交易日的決策成交（packet 盤前順手呼叫）。回傳寫入的 entry 或 None。
+    """結算前一交易日的決策成交（packet 盤前順手呼叫）。回傳寫入的 entry 或 None。"""
+    return settle_day(api, previous_weekday(today), today, path, price_dir)
 
-    前一平日若休市（國定假日，以 0050 當日有無行情判定）不算缺席；
-    已結算或已記缺席的日期不重複寫。
+
+def settle_day(api, day, today, path=JOURNAL, price_dir=None):
+    """結算 `day` 的決策成交，以 `today` 為記錄日。回傳寫入的 entry 或 None。
+
+    `day` 若休市（國定假日，以 0050 當日有無行情判定）不算缺席；
+    已結算或已記缺席的日期不重複寫。`day == today` 是成交後立刻結算
+    （daily.py trade）——成交比對用的是決策包的盤前持倉對現在持倉，當天就能算。
     """
     import shioaji as sj
     import packet as packet_mod
 
-    prev = previous_weekday(today)
     kwargs = {"directory": price_dir} if price_dir else {}
-    if not market.fetch_daily(api, packet_mod.BENCHMARK, prev, prev, **kwargs):
+    if not market.fetch_daily(api, packet_mod.BENCHMARK, day, day, **kwargs):
         return None                      # 休市日
     entries = load_entries(path)
-    if any(e.get("type") == "fill" and e.get("decision_ref") == prev for e in entries):
+    if any(e.get("type") == "fill" and e.get("decision_ref") == day for e in entries):
         return None
-    if any(e.get("type") == "missed" and e.get("date") == prev for e in entries):
+    if any(e.get("type") == "missed" and e.get("date") == day for e in entries):
         return None
 
     now = dt.datetime.now().replace(microsecond=0).isoformat()
-    decision = first_decision(entries, prev)
+    decision = first_decision(entries, day)
     if decision is None:
-        pk = packet_mod.load_packet(prev)
-        entry = {"type": "missed", "date": prev, "ts": now,
+        pk = packet_mod.load_packet(day)
+        entry = {"type": "missed", "date": day, "ts": now,
                  "reason": "未做決策" if pk else "packet 未產生"}
         append_entry(entry, path)
         return entry
     if decision.get("no_trade"):
-        entry = {"type": "fill", "date": today, "ts": now, "decision_ref": prev,
+        entry = {"type": "fill", "date": today, "ts": now, "decision_ref": day,
                  "fills": [], "unfilled": [], "note": "no_trade"}
         append_entry(entry, path)
         return entry
 
-    pl = api.list_profit_loss(api.stock_account, prev, prev, unit=sj.Unit.Share)
+    pl = api.list_profit_loss(api.stock_account, day, day, unit=sj.Unit.Share)
     pl_rows = [{"code": r.code, "quantity": int(r.quantity), "price": float(r.price)}
                for r in pl]
     after = {p.code: {"qty": int(p.quantity), "avg_price": float(p.price)}
              for p in api.list_positions(api.stock_account, unit=sj.Unit.Share)}
-    pk = packet_mod.load_packet(prev)
+    pk = packet_mod.load_packet(day)
     before = raw_positions((pk or {}).get("account", {}).get("positions", {}))
-    ext = external_legs(entries, prev, decision.get("lock"))
+    ext = external_legs(entries, day, decision.get("lock"))
     ext_buys = {}
     for leg in ext:
         if leg.get("action") == "buy":
@@ -401,9 +547,20 @@ def settle_previous(api, today, path=JOURNAL, price_dir=None):
     fills, unfilled = match_fills(decision.get("orders", []),
                                   deduct_external_legs(pl_rows, ext),
                                   before, after, external_buys=ext_buys)
-    entry = {"type": "fill", "date": today, "ts": now, "decision_ref": prev,
+    entry = {"type": "fill", "date": today, "ts": now, "decision_ref": day,
              "fills": fills, "unfilled": unfilled}
     append_entry(entry, path)
+
+    try:
+        import risk
+        env = load_envelope(day)
+        stop_loss = ((env or {}).get("satellite", {}).get("stop_loss")
+                     or risk.DEFAULTS["satellite_stop_loss"])
+        append_exits(satellite_exits_from({**decision, "date": day}, fills, before, stop_loss))
+        persist_satellite_assignments(decision, fills)
+    except Exception as exc:
+        print(f"⚠️ 停損出場紀錄／衛星軌指派寫入失敗（成交紀錄已保存）：{exc}", file=sys.stderr)
+
     return entry
 
 
@@ -420,6 +577,8 @@ def main():
                      help="硬規則違規仍寫入（entry 會帶 violations，紀律報告照列）")
     st = sub.add_parser("settle", help="結算前一交易日的成交")
     st.add_argument("--date", help="以此日為「今天」（預設今天）")
+    st.add_argument("--same-day", action="store_true",
+                    help="改結算「今天」的決策（成交後立刻結算，daily.py trade 用）")
     sh = sub.add_parser("show", help="列出日誌")
     sh.add_argument("--date", help="只列此日期相關的紀錄")
     args = ap.parse_args()
@@ -449,9 +608,10 @@ def main():
     if args.cmd == "settle":
         today = args.date or dt.date.today().isoformat()
         with market.session() as api:
-            entry = settle_previous(api, today)
+            entry = (settle_day(api, today, today) if args.same_day
+                     else settle_previous(api, today))
         if entry is None:
-            print("無需結算（前一交易日已結算、已記缺席、或休市）")
+            print("無需結算（已結算、已記缺席、或休市）")
         elif entry["type"] == "missed":
             print(f"⚠️ {entry['date']} 缺席：{entry['reason']}")
         else:

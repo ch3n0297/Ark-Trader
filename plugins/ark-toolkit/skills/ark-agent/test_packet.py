@@ -1,5 +1,6 @@
 """ark-agent 決策包純邏輯測試（不需要 ARK 或 Shioaji，任何平台可跑）"""
 import os
+import tempfile
 import unittest
 import unittest.mock
 from types import SimpleNamespace
@@ -310,5 +311,106 @@ class TestBrokerPositions(unittest.TestCase):
         self.assertEqual(packet.positions_diff(holdings, got), [])
 
 
+ZONE_VALUE = {"6274": {"name": "台燿", "sector": "PCB-製造", "rev_yoy": 132.48, "k9": 21.2},
+              "2330": {"name": "台積電", "sector": "半導體", "rev_yoy": 30.0, "k9": 25.0}}
+ZONE_HEAT = {"6274": {"name": "台燿", "sector": "PCB-製造", "rev_yoy": 132.48, "k9": 91.0},
+             "3374": {"name": "精材", "sector": "IC-封測", "rev_yoy": 30.9, "k9": 93.2}}
+
+
+class TestBuildIndustry(unittest.TestCase):
+    def test_價值區為候選_同掛升溫者標記(self):
+        ind = packet.build_industry(ZONE_VALUE, ZONE_HEAT, known_sectors={}, source="api/st/10")
+        self.assertEqual(set(ind["candidates"]), {"6274", "2330"})
+        self.assertTrue(ind["candidates"]["6274"]["heating"])
+        self.assertFalse(ind["candidates"]["2330"]["heating"])
+        self.assertEqual(ind["candidates"]["2330"]["sector"], "半導體")
+        self.assertEqual(ind["source"], "api/st/10")
+        self.assertIsNone(ind["error"])
+
+    def test_產業別累積_已知的不被清掉(self):
+        ind = packet.build_industry(ZONE_VALUE, ZONE_HEAT,
+                                    known_sectors={"2308": "電子零組件"}, source="api/st/10")
+        self.assertEqual(ind["sectors"]["2308"], "電子零組件")
+        self.assertEqual(ind["sectors"]["3374"], "IC-封測")     # 升溫區的也記，之後持有時用得到
+
+    def test_API失敗時無候選但保留已知產業別(self):
+        ind = packet.build_industry(None, None, known_sectors={"2330": "半導體"},
+                                    source=None, error="連不上")
+        self.assertEqual(ind["candidates"], {})
+        self.assertEqual(ind["sectors"], {"2330": "半導體"})
+        self.assertEqual(ind["error"], "連不上")
+
+
+class TestNewsScopeWithIndustry(unittest.TestCase):
+    def test_候選進資訊邊界(self):
+        ind = packet.build_industry(ZONE_VALUE, {}, known_sectors={}, source="api/st/10")
+        codes = packet.news_scope_codes(HOLDINGS, LAYOUT, industry=ind)
+        self.assertIn("6274", codes)
+        self.assertIn("0050", codes)
+
+
+class TestPacketCarriesIndustry(unittest.TestCase):
+    def test_industry進packet並影響hash(self):
+        ind = packet.build_industry(ZONE_VALUE, {}, known_sectors={}, source="api/st/10")
+        a = packet.build_packet(
+            date="2026-08-10", generated_at="t", holdings=HOLDINGS, declared=4,
+            posture=POSTURE, layout=LAYOUT, positions={}, balance=0.0, settlements={},
+            quotes={}, recent_daily={}, sync_ok=True, diff=[], industry=ind)
+        b = packet.build_packet(
+            date="2026-08-10", generated_at="t", holdings=HOLDINGS, declared=4,
+            posture=POSTURE, layout=LAYOUT, positions={}, balance=0.0, settlements={},
+            quotes={}, recent_daily={}, sync_ok=True, diff=[])
+        self.assertEqual(a["industry"]["candidates"]["2330"]["sector"], "半導體")
+        self.assertEqual(b["industry"]["candidates"], {})
+        self.assertNotEqual(a["hash"], b["hash"])
+
+
+class TestSectorsFile(unittest.TestCase):
+    def test_存取往返(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "sectors.json")
+            self.assertEqual(packet.load_sectors(p), {})
+            packet.save_sectors({"2330": "半導體"}, p)
+            self.assertEqual(packet.load_sectors(p), {"2330": "半導體"})
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestIndustryKeepsZoneLists(unittest.TestCase):
+    """燈號判定要兩份名單都完整：讀不到是 None（未知），讀到但沒有才是 []。"""
+
+    def test_讀取成功時保存整份價值區與升溫區代號(self):
+        ind = packet.build_industry(ZONE_VALUE, ZONE_HEAT, known_sectors={}, source="api/st/10")
+        self.assertEqual(ind["value_codes"], ["2330", "6274"])
+        self.assertEqual(ind["heating_codes"], ["3374", "6274"])
+
+    def test_升溫區讀到但為空_是空清單不是未知(self):
+        ind = packet.build_industry(ZONE_VALUE, {}, known_sectors={}, source="api/st/10")
+        self.assertEqual(ind["heating_codes"], [])
+
+    def test_API失敗時兩份名單皆為未知(self):
+        ind = packet.build_industry(None, None, known_sectors={}, source=None, error="連不上")
+        self.assertIsNone(ind["value_codes"])
+        self.assertIsNone(ind["heating_codes"])
+
+
+class TestMarketOpen(unittest.TestCase):
+    """休市日（國定假日）不產生決策包：快照與日K都停在前一個交易日。"""
+
+    def test_休市日_日K與快照都停在前一交易日(self):
+        bars = [{"date": "2026-10-07", "close": 116.0}, {"date": "2026-10-08", "close": 115.5}]
+        quote = {"close": 115.5, "ts": "2026-10-08T13:30:00"}
+        self.assertFalse(packet.market_open("2026-10-09", bars, quote))
+
+    def test_交易日_當日已有日K(self):
+        bars = [{"date": "2026-10-08", "close": 115.5}, {"date": "2026-10-12", "close": 116.2}]
+        self.assertTrue(packet.market_open("2026-10-12", bars, None))
+
+    def test_開盤初期尚無日K但快照是今天(self):
+        quote = {"close": 116.0, "ts": "2026-10-12T09:00:05"}
+        self.assertTrue(packet.market_open("2026-10-12", [], quote))
+
+    def test_完全沒有資料視為未開盤(self):
+        self.assertFalse(packet.market_open("2026-10-12", [], None))

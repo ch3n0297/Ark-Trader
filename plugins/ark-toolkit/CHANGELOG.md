@@ -3,6 +3,96 @@
 本檔記錄 ark-toolkit 的版本沿革。版本語意：主版號＝正式里程碑，
 次版號＝行為或語意變更，修訂號＝bug 修正。
 
+## [1.8.1] - 2026-10-12
+
+- **修：翻頁讀取等畫面靜止再收集**。`lib/ark.py` 的 `_scroll_until_stable` 每次捲動後
+  先等連續兩次探測結果相同才收集；翻頁動畫中途 AX tree 只暴露兩三列，那時收集會整段
+  跳列（2026-10-10 實機 17 檔只讀到 13～14 檔，且沒有解析失敗樣本，`check_parsed`
+  攔不到）。到上限仍在變就照當下畫面走，交給 `check_parsed` 把關。所有經此翻頁讀取
+  ARK 庫存列的路徑（ark-sync、ark-agent 對帳）同受影響。
+- `.codex-plugin/plugin.json` 版號自 1.4.0 起未隨版更新，本版補齊。
+- 測試：`test_journal` 當日結算案例改塞假 `shioaji` 模組，乾淨環境依 README 跑不再
+  `ModuleNotFoundError`；README 的 ark-agent 測試行補上 1.5.0 起新增的 `test_gates`。
+
+## [1.8.0] - 2026-10-08
+
+- **suggest_qty 語意寫進決策提示**。它是調節庫存頁的建議調節（賣出）股數，不是持有目標：
+  建議 0 不得推論為「App 不建議持有」，「持有 − suggest_qty」不得稱為 App 建議。
+  2026-10-02～10-08 決策層連續 7 筆以「持有 − 建議」當賣量；提示也註明前幾天的
+  決策檔是未經複盤的案例，不是準則。「可提早減」只適用減碼，不適用停損。
+- **個股桶燈號判定**：packet 的 `industry` 保存完整 `value_codes`／`heating_codes`
+  （讀不到是 null）；`risk.lamp_state` 以調節庫存列位階與兩份名單判出
+  `envelope.satellite.lamps`，來源缺失、型別不對或讀取失敗一律 `unknown`。
+- **可設定的燈號必賣**：`ARK_LAMP_EXIT`（預設關閉；`all` 或代號清單）開啟後，範圍內
+  確認無燈號的個股桶部位列入 `lamp_exits`，journal 要求整筆賣出（不能賣的日子不強制）。
+- **休市跳過**：packet 在碰 App 前先查基準 0050 的當日日K與快照，休市離開碼 3，
+  daily 視為今日不交易，不拿前一交易日的行情做決策。
+- **複盤抓 K 線有界降級**：逐檔失敗改用區間內快取、連續失敗 3 檔即停止嘗試，報告
+  開頭標示「行情不完整」，未到期者照列 pending（2026-10-02 複盤因單次逾時整支中斷）。
+- **複盤區間從上次成功複盤隔天起算**（最多回看 28 天）：某次複盤失敗時，那幾天的
+  案例不再永遠掉出 7 天視窗。「成功」以 `~/.ark-toolkit/agent/reviews/completed.jsonl`
+  的成功紀錄為準——只在模型零離開、準則完整、檢討檔存在之後才寫；複盤層可能先寫出
+  檢討檔才失敗，檔案存在不算數。成功紀錄上線（2026-10-08）前的檢討檔視為已完成。`prompts/review.md` 要求逐項處理準則檔的「待複盤事項」。
+- 另含 54e1fe7：編輯庫存頁貼底列先捲動再按、重啟後就緒探測在時限內重試。
+
+## [1.7.0] - 2026-09-28
+
+- **準則歸因改為逐筆委託**。決策的每筆委託可帶自己的 `rules_applied`，
+  `review.rule_performance` 只把那筆單的損益歸給它列的準則。原本準則掛在決策層，
+  當天每筆單都記到當天每條準則上；決策若每天把準則全列，各條的數字就一模一樣
+  （實例：R-003 與 R-004 的已評筆數、勝率、平均報酬完全相同），歸因表分不出功過。
+  委託上沒有這個欄位的舊紀錄退回決策層清單，歷史數字不變；明示 `[]` 代表這筆單
+  沒有準則驅動，不退回。決策層的 `rules_applied` 保留，記當天用到的全部準則。
+  `prompts/decide.md` 同步要求逐筆填寫；journal 不對委託層編號加驗證。
+- **歸因表加超額**：`rule_performance` 多回 `avg_excess`、`excess_win_rate`，報表多
+  「平均超額」「超額為正」兩欄。報酬為正但落後基準的準則不算被損益支持。
+- 複盤案例的每筆單印出它引用的準則。
+
+## [1.6.1] - 2026-09-27
+
+- **修：運算頁現金欄重複計算今日交割款**。`sync.posture_cash` 取
+  `balance + today + t1 + t2`，但 `t_money` 在交割日當天已入帳 `acc_balance`——
+  與 1.2.1 在 `equity.py` 修掉的是同一種錯，當時沒一併修到 ark-sync。以 25 份歷史
+  決策包對帳：相鄰交易日的餘額變動 16 次全等於當日 `t_money`。小額買進日誤差約
+  1–2%，大額調節後的交割日才顯形：2026-09-24 餘額 55,828 已含入帳的賣出款 33,893，
+  現金欄卻寫成 80,560，ARK 據此算出的持股比由實際約 70% 變成 58%（hold 判成 buy），
+  個股桶配額同步虛增。改取 `balance + t1 + t2`，口徑同 `equity.tradable_cash`，
+  附 9/24 的回歸測試；輸出的「未交割」分項同步只計 t1／t2。
+- **修：App 被登出時就緒探測誤判為殭屍態**。登入頁沒有 tab bar 也沒有 back，
+  `ark.ensure_responsive` 會重啟 App 再空等 90 秒，最後報「等待逾時：重啟後 tab bar
+  出現」——訊息指向冷啟太慢，真正原因是 session 過期。新增 `ArkLoggedOut`：探測失敗
+  後與重啟後的等待中都先認登入頁（「會員登入」），認到就直接報已登出、不重啟。
+- **修：ARK 視窗被蓋住時現金欄寫不進**。運算頁的數字鍵盤只能座標點擊，而座標點擊
+  走全域滑鼠事件、落在該座標最上層的視窗；ARK 在背景且被別的視窗蓋住時，點擊全落
+  在那個視窗上，欄位維持原值、對帳回報失敗（先前記為「現金欄偶爾第一次寫不進」）。
+  `write_posture_cash` 在開鍵盤前先 `ax.activate()`；其餘操作仍可在背景進行。
+
+## [1.6.0] - 2026-09-23
+
+- **`daily.py trade`（ark-agent「手動一場」）**：不用排程、由人說「開始交易」才動，
+  順序寫死：對帳統一（`sync --allow-delete --with-cash`）→ decide 的五步 → 等成交 → 當日
+  結算五步。開始時段 09:00–13:00（`TRADE_WINDOW`），當日已有決策即拒絕（execute 送的是
+  第一筆決策，再跑等於重送）。`decide`／`settle` 原樣保留給用排程的人；SKILL.md 新增
+  啟動／監看／回報的 SOP 一節。
+- **execute `--wait MINUTES`**：送單後留在線上輪詢，全部終態即回；逾時仍掛著的腿刪單並在
+  journal 追加 `cancel` 記錄。execution 記錄改在等待前落地，途中行程死掉也看得到哪幾腿送出。
+- **journal `settle --same-day`**：`settle_previous` 抽成 `settle_day(api, day, today)`，
+  成交後立刻結算當日決策（fill 的 `date` 與 `decision_ref` 同日）。
+
+## [1.5.0] - 2026-09-09
+
+- **個股桶（兩桶制）**：衛星軌改為由 ARK 產業價值區供應候選（`lib/arkapi.zone()`，
+  唯讀，含營收、利潤、負債、產業別、K9），配額改為總資源×ARK 建議持股比×佔投入比
+  （起始 50%），單檔／同產業硬上限（起始 12%／25%）由 `journal` 拒單，超限列
+  `envelope.satellite.trim_candidates`；閘門在 `gates.json`（新模組 `gates.py`），
+  每週複盤可在區間內調整，超出由 `daily.py review` 還原。
+- **packet**：`industry` 區塊（候選、升溫標記、產業別累積 `sectors.json`），候選納入 `news_scope`。
+- **evaluate**：個股桶分開統計前瞻報酬，主軌口徑不變。
+- **journal settle**：寫入 `satellite_exits.jsonl`，連續停損冷卻自此生效。
+- **evaluate**：修 `evaluate_all` 迴圈的 `fills` 變數遮蔽——第二個決策日起成交對回被靜默
+  丟掉、改用決策日收盤與 no_fill 評估；修後所有第 2 日以後的 exec_price 與紀律分會變動。
+- **arkapi**：錯誤訊息不再帶查詢字串（deviceToken 曾可能流入 `packet.industry.error`）。
+
 ## [1.4.0] - 2026-09-04
 
 - **ark-agent 每週自動複盤**：`daily.py review`（launchd `com.hjc.ark-agent.review.plist`，

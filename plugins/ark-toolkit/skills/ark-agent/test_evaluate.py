@@ -186,6 +186,28 @@ class TestAdherence(unittest.TestCase):
         self.assertFalse(a["components"]["非修訂決策"])
         self.assertLess(a["score"], 1.0)
 
+    def test_檔數為參考值時不計分(self):
+        """ARK_NAMES_CAP=advisory：買幾檔由決策層判斷，超過公式值不是違紀，
+        這一項不適用、不進分母（否則每個多於公式值的日子都被扣到 75%）"""
+        pk = {**PK, "discipline": {**PK["discipline"], "names_cap": "advisory",
+                                   "adjust_required_before_buy": False,
+                                   "buy_candidates": ["0050", "0056"]}}
+        buy3 = {**DECISION, "orders": [
+            {"action": "buy", "code": "0050", "qty": 10, "limit_low": 100.0, "limit_high": 101.0},
+            {"action": "buy", "code": "0056", "qty": 10, "limit_low": 50.0, "limit_high": 51.0}]}
+        a = evaluate.adherence(buy3, pk, None)
+        self.assertNotIn("檔數未超限", a["components"])
+        self.assertEqual(a["score"], 1.0)
+
+    def test_檔數為硬上限時照扣(self):
+        pk = {**PK, "discipline": {**PK["discipline"], "adjust_required_before_buy": False,
+                                   "buy_candidates": ["0050", "0056"]}}
+        buy3 = {**DECISION, "orders": [
+            {"action": "buy", "code": "0050", "qty": 10, "limit_low": 100.0, "limit_high": 101.0},
+            {"action": "buy", "code": "0056", "qty": 10, "limit_low": 50.0, "limit_high": 51.0}]}
+        a = evaluate.adherence(buy3, pk, None)
+        self.assertFalse(a["components"]["檔數未超限"])
+
     def test_衛星軌委託不計入ARK紀律(self):
         """衛星軌本來就不受 ARK 紀律約束，把它算進遵循度等於自己扣自己分"""
         mixed = {**DECISION, "orders": DECISION["orders"] + [
@@ -231,6 +253,67 @@ class TestEvaluateAll(unittest.TestCase):
         for word in ("顯著", "p 值", "p<", "信賴區間", "統計檢定"):
             self.assertNotIn(word, text)
         self.assertIn("描述性統計", text)
+
+    def test_第二個決策日的成交對回不被遮蔽(self):
+        """`_order_rows` 內把 fills_for_day 轉成區域變數前，舊迴圈用同一個名字
+        `fills` 覆寫了外層的 fills_by_ref 字典，導致第二個決策日起 fe 恆為
+        None——退用決策日收盤、exec_status 變成 no_fill。這裡固定兩個決策日
+        各自都有對回，確認第二天不會被第一天的重新賦值蓋掉。"""
+        d1 = {"type": "decision", "date": "2026-08-03", "packet_hash": "sha256:1",
+              "no_trade": False, "orders": [{"action": "buy", "code": "0050", "qty": 10}],
+              "lock": "sha256:l1"}
+        f1 = {"type": "fill", "date": "2026-08-04", "decision_ref": "2026-08-03",
+              "fills": [{"code": "0050", "action": "buy", "qty": 10, "price": 101.0}],
+              "unfilled": []}
+        d2 = {"type": "decision", "date": "2026-08-04", "packet_hash": "sha256:2",
+              "no_trade": False, "orders": [{"action": "buy", "code": "0050", "qty": 10}],
+              "lock": "sha256:l2"}
+        f2 = {"type": "fill", "date": "2026-08-05", "decision_ref": "2026-08-04",
+              "fills": [{"code": "0050", "action": "buy", "qty": 10, "price": 102.0}],
+              "unfilled": []}
+        report = evaluate.evaluate_all([d1, f1, d2, f2], {}, {"0050": RISING}, BENCH, [])
+        self.assertEqual(len(report["orders"]), 2)
+        day2 = report["orders"][1]
+        self.assertEqual(day2["date"], "2026-08-04")
+        self.assertEqual(day2["exec_status"], "filled")
+        self.assertEqual(day2["exec_price"], 102.0)
+
+
+class TestSatelliteSection(unittest.TestCase):
+    def test_衛星軌單獨統計_不混入主軌(self):
+        core = {"action": "buy", "code": "0050", "qty": 10, "track": "core",
+                "limit_low": 100.0, "limit_high": 101.0}
+        sat = {"action": "buy", "code": "2330", "qty": 1, "track": "satellite",
+               "limit_low": 100.0, "limit_high": 101.0}
+        entries = [{"type": "decision", "date": "2026-08-03", "packet_hash": "sha256:x",
+                    "no_trade": False, "orders": [core, sat], "lock": "sha256:l"}]
+        prices = {"0050": RISING, "2330": RISING}
+        report = evaluate.evaluate_all(entries, {}, prices, BENCH, [])
+        self.assertEqual(report["n_orders"], 1)                       # 主軌只有 0050
+        self.assertEqual(report["satellite"]["n_orders"], 1)
+        self.assertEqual(report["satellite"]["orders"][0]["code"], "2330")
+        self.assertEqual(report["satellite"]["horizons"][5]["evaluated"], 1)
+
+    def test_render含個股桶段落(self):
+        report = evaluate.evaluate_all([], {}, {}, BENCH, [])
+        self.assertIn("個股桶", evaluate.render(report))
+
+    def test_render個股桶段落含數值分支(self):
+        """既有測試只跑過空報告的 '-' 分支；這裡要有實際成交列才會走到
+        win_rate／avg_return／avg_excess 都不是 None 的那條路。"""
+        core = {"action": "buy", "code": "0050", "qty": 10, "track": "core",
+                "limit_low": 100.0, "limit_high": 101.0}
+        sat = {"action": "buy", "code": "2330", "qty": 1, "track": "satellite",
+               "limit_low": 100.0, "limit_high": 101.0}
+        entries = [{"type": "decision", "date": "2026-08-03", "packet_hash": "sha256:x",
+                    "no_trade": False, "orders": [core, sat], "lock": "sha256:l"}]
+        prices = {"0050": RISING, "2330": RISING}
+        report = evaluate.evaluate_all(entries, {}, prices, BENCH, [])
+        section = evaluate.render(report).split("【個股桶】", 1)[1]
+        self.assertIn("T+5", section)
+        self.assertIn("100%", section)          # win_rate
+        self.assertIn("+5.00%", section)        # avg_return
+        self.assertIn("+0.00%", section)        # avg_excess（標的與 0050 同幅上漲）
 
 
 class TestDividendHonesty(unittest.TestCase):
