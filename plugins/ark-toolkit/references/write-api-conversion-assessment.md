@@ -35,20 +35,29 @@ ARK API 的可行性、證據、未知數與落地設計。對應 1.9.0 已完�
 
 ## 3. 證據（2026-10-12 mitm 實測）
 
-用 mitmproxy 攔到一筆真實的改庫存（00935 股數 32→33→32，淨零），確認了格式：
+用 mitmproxy 分幾次攔到**全部五個**寫入（改股數、改均價、新增、刪除、改現金），皆回
+`{"code":"0000","message":"操作成功"}`、**無 checksum**、認證同讀取。擷取用 `files/ark_capture.py`
+（ArkAPI_Catch）完成，基準存在該專案的 `ark_api_baseline.json`。
+
+| 寫入 | 送法（實測） |
+|---|---|
+| 改股數／均價 | `POST api/myStock/update/{member_id}/{code}/{kind}/{qty}/{avgPrice}` — **參數全在 path**、body `{}`、query 帶 device |
+| 連帶更新均價 | `POST api/myStock/avgPrice/upsert`，body `{member_id, stock_code, data_date:"YYYYMMDD", avg_price, device…}` |
+| 新增 | `POST api/myStock/insert`，body `{member_id, stock_code, type, market, totle_count, avg_price, device…}`（欄位拼法是 `totle_count`） |
+| 刪除 | `POST api/myStock/delete/{member_id}/{code}/{kind}` — **參數全在 path**、query 帶 device |
+| 現金 | `POST api/calculateRisk/memberMoney/update`，body `{member_id, amount_twd, amount_usd, device…}`（同時帶台幣與美元） |
+
+共通：
 
 | 項目 | 結果 |
 |---|---|
-| 改股數／均價 | `POST api/myStock/update/{member_id}/{code}/{kind}/{qty}/{avgPrice}` — **參數全在 URL path**；query 只帶 `?deviceType=I&deviceToken=…`；**body 為空 `{}`** |
-| 連帶更新均價 | `POST api/myStock/avgPrice/upsert`，body `{member_id, deviceType, deviceToken, stock_code, data_date:"YYYYMMDD", avg_price}` |
 | `checksum` / 簽章 | **不需要**。寫入 header 無任何 checksum／sign；`checksumEnabled` 不卡這些寫入。（二進位的 MD5 字串來自 Firebase 效能監控，非請求簽章） |
-| 認證 | 與讀取相同：`Authorization: Bearer <app token>` ＋ `deviceType=I&deviceToken=…`。讀取用的 App token 足以寫入 |
-| 回應 | `{"code":"0000","message":"操作成功"}`（只回成功，不回寫入後狀態） |
-| User-Agent | `Arkeration/1.9.3 (com.galaxy.ark; build:1.9.3.0; iOS 26.6.0) Alamofire/5.9.0`（建議比照，未確認是否必需） |
+| 認證 | 與讀取相同：`Authorization: Bearer <app token>` ＋ `deviceType=I&deviceToken=…` |
+| 回應 | `{"code":"0000","message":"操作成功"}`（只回成功，不回寫入後狀態，故需 read-after-write） |
+| User-Agent | `Arkeration/1.9.3 (com.galaxy.ark; build:1.9.3.0; iOS 26.6.0) Alamofire/5.9.0`（已比照帶上） |
 
-**結論**：改庫存的完整送法已驗證，且**沒有 checksum 障礙**——這是先前最大的未知數，現已清除。
-`insert`／`delete`／`memberMoney/update`（現金）尚未各攔一筆，格式可由此類推，但落地前建議
-比照各實測一次（見第 7 節）。
+**結論**：五個寫入的完整送法都已驗證，**沒有 checksum 障礙**。`arkapi` 的寫入層已依此實作
+（見第 6 節），預設關閉。
 
 ## 4. 如何取代「總成本」這個獨立見證
 
@@ -75,61 +84,34 @@ ARK API 的可行性、證據、未知數與落地設計。對應 1.9.0 已完�
 
 沒有任何一項會送出委託；最壞是建議 App 顯示錯誤，read-after-write 會當場攔下。
 
-## 6. 設計提案（尚未接線）
+## 6. 實作（已接線，預設關閉）
 
-保持 `call()` 唯讀不變，另立寫入通道，預設關閉、需顯式開啟。因實測確認**不需 checksum**，
-通道比原先設想簡單——送出 ＋ read-after-write 讀回驗證即可：
+`lib/arkapi.py` 已加寫入層，`call()` 唯讀不變。雙重開關：需 `confirm=True` 且環境變數
+`ARK_API_WRITES=1`，否則連送都不送（`WritesDisabled`）。因實測無 checksum，通道即
+「送出 ＋ read-after-write 讀回驗證」。對外函式：
 
-```python
-# arkapi.py —— 提案，未接線
-WRITE_ENDPOINTS = {
-    "api/myStock/update/{member_id}/{code}/{kind}/{qty}/{avgPrice}",  # 改股數/均價（path 參數、body {}）
-    "api/myStock/avgPrice/upsert",                                    # 連帶更新均價（body 帶欄位）
-    "api/myStock/insert", "api/myStock/delete/{member_id}/{code}",    # 新增/刪除（格式待各攔一次確認）
-    "api/calculateRisk/memberMoney/update",                           # 現金（待實測）
-}
+| 函式 | 端點 | 讀回驗證 |
+|---|---|---|
+| `set_cash(sess, twd, usd=None)` | `memberMoney/update` | `cash()` 比對台幣；`usd=None` 時先讀回保留美元，避免歸零 |
+| `insert_holding(sess, code, qty, avg_price)` | `myStock/insert` | `positions()` 確認該檔股數 |
+| `update_holding(sess, code, qty, avg_price)` | `myStock/update/{…}` ＋ `avgPrice/upsert` | `positions()` 比對股數／均價 |
+| `delete_holding(sess, code)` | `myStock/delete/{…}` | `positions()` 確認已消失 |
 
-def write(sess, path, *, body=None, query=None, verify, confirm=False, fetch=_fetch, now=None):
-    """送出一次寫入。預設拒絕：必須 confirm=True 且環境變數 ARK_API_WRITES=1。
-    verify(sess) 是寫入後讀回驗證的 callable，回 True 才算成功。無 checksum。"""
-    if not (confirm and os.environ.get("ARK_API_WRITES") == "1"):
-        raise PermissionError("寫入預設關閉：需 confirm=True 且 ARK_API_WRITES=1")
-    if _templatize(path) not in WRITE_ENDPOINTS:
-        raise ValueError(f"不在寫入白名單：{path}")
-    if not token_valid(sess.token, now=now):
-        raise ArkApiError("登入憑證已過期")
-    params = {"deviceType": "I", "deviceToken": sess.device_token, **(query or {})}
-    url = BASE + path + "?" + urllib.parse.urlencode(params)
-    headers = {"Authorization": f"Bearer {sess.token}", "Accept": "*/*",
-               "Content-Type": "application/json"}
-    resp = fetch(url, headers, body if body is not None else {})   # 空 body 也送 {}
-    if resp.get("code") != "0000":
-        raise ArkApiError(f"寫入未成功 code={resp.get('code')}：{resp.get('message')}")
-    if not verify(sess):                 # read-after-write：讀回不符即失敗
-        raise ArkApiError("寫入後讀回與目標不符，視為未生效")
-    return resp
-```
+要點：寫入與讀取白名單分離；顯式 opt-in（旗標＋`confirm`）；**無 checksum**；
+**read-after-write 當獨立見證**（取代 AX 的「總成本」）；台股 `type/market` 預設 `"1"`；
+券商下單不在此層。測試見 `lib/test_arkapi.py::TestWriteLayer`（假 fetch、不連網）。
 
-要點：寫入白名單與讀取白名單分離；顯式 opt-in（旗標＋`confirm`）；**無 checksum**；
-**read-after-write 當獨立見證**；`sync` 仍可保留 AX 寫入當回退與對照。
+## 7. 進度
 
-改一檔庫存 = 兩支呼叫（實測）：`myStock/update/{...}/{qty}/{avgPrice}`（path 參數、body `{}`）
-＋ `myStock/avgPrice/upsert`（body 帶 `member_id, stock_code, data_date, avg_price`）。
-verify 用 `arkapi.positions()` 讀回該檔比對股數／均價。
+1. ✅ 抓真實寫入（2026-10-12）：五個寫入全部實測，格式見第 3 節，確認**無 checksum**。
+2. ✅ `arkapi` 寫入層已實作並通過測試（見第 6 節），預設關閉。
+3. ⏳ **選用**：把 `ark-sync` 的寫入從 AX 改走這些函式（旗標後），沿用現有安全閘（來源讀空
+   拒絕、刪除過半拒絕、dry-run），AX 保留當回退與第二見證。尚未動——改現有交易工具的
+   寫入路徑風險較高，待明確需求再做。
+4. 券商下單維持 Shioaji 不動，永不轉 ARK 端點。
 
-## 7. 落地前必須先做的事（順序）
+## 8. 目前狀態
 
-1. ~~**抓一筆真實寫入**~~ ✅ **已完成（2026-10-12）**：mitm 攔到 `myStock/update` ＋
-   `myStock/avgPrice/upsert`，格式見第 3 節，確認**無 checksum**。
-2. **補攔 `insert`／`delete`／`memberMoney/update` 各一筆**（同法，各做一次真實小改動再還原），
-   確認剩下三個寫入的 path／body。
-3. **先做現金**（單欄位、最好驗證）：`write()` + `arkapi.cash()` 讀回驗證，旗標後。
-4. **再做庫存** update/insert/delete，沿用 read-after-write 與現有安全閘（來源讀空拒絕、
-   刪除過半拒絕、dry-run）。
-5. **保留 AX 寫入**當回退與第二見證；券商下單維持 Shioaji 不動。
-
-## 8. 目前建議
-
-最大障礙（checksum）已排除，改庫存送法也實測確認，**技術上可落地**。建議：補攔其餘三個
-寫入端點（第 7.2）後，依第 6 節在旗標後先接現金、再接庫存，一律帶 read-after-write 驗證，
-並保留 AX 寫入當回退。在接線完成並通過測試前，預設仍走 AX。
+寫入轉 API 技術上已完成且可用：格式實測、無 checksum、函式與測試就緒，但**預設關閉**
+（需 `ARK_API_WRITES=1`＋`confirm=True`）。`ark-sync` 的實際寫入仍走 AX；要切成 API 寫入
+是第 7.3 的獨立決定。日後 App 改版要重驗端點：用 `files/ark_capture.py`（`up`→操作→`diff`）。

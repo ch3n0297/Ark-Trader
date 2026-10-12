@@ -23,11 +23,14 @@
 - **寫入與下單維持 AX 不變**：改庫存（新增／修改／刪除）與運算頁現金欄仍走畫面，保留
   App 自算「總成本」當獨立見證；相應的寫入 API 端點未經驗證，且寫入／下單不可逆，
   不從唯讀層走——`api/auth`（換發 token，body 帶 appId／appSecret）亦刻意排除於白名單外。
-- **寫入轉 API 評估**：`references/write-api-conversion-assessment.md` 盤點 AX 寫入對應的
-  ARK 端點（`myStock/update`／`avgPrice/upsert`／`insert`／`delete`、`memberMoney/update` 等）、
-  釐清「ARK 寫入≠下單」（真正下單走 Shioaji）、提出以 read-after-write 取代「總成本」見證。
-  已用 mitm 實測攔到改庫存寫入：參數在 URL path、body 空、認證同讀取，且**不需 checksum**
-  （先前最大的未知數已排除）；技術上可落地，詳見該文件。
+- **arkapi 寫入層（預設關閉）**：依 mitm 實測格式加入 `set_cash`／`insert_holding`／
+  `update_holding`／`delete_holding`。五個寫入端點（`myStock/insert`、`update/{…}`、
+  `avgPrice/upsert`、`delete/{…}`、`calculateRisk/memberMoney/update`）全部實測確認、
+  認證同讀取、**無 checksum**。雙重開關（`confirm=True` ＋ 環境變數 `ARK_API_WRITES=1`），
+  每筆帶 read-after-write 讀回驗證取代 AX 的「總成本」見證；`set_cash` 省略 usd 時保留原
+  美元現金避免歸零。預設完全不作用，`ark-sync` 實際寫入仍走 AX。評估、格式、擷取工具
+  見 `references/write-api-conversion-assessment.md`（以 `ArkAPI_Catch/files/ark_capture.py`
+  擷取、可 `diff` 回歸）。釐清「ARK 寫入≠下單」：真正買賣走 Shioaji，不轉 ARK 端點。
 
 ## [1.8.1] - 2026-10-12
 

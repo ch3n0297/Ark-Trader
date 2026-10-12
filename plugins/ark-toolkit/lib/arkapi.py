@@ -342,3 +342,120 @@ def common_config(sess, **kw):
     """App 共用設定清單。撰寫時未對照過實際回應欄位，故走通用 rows()：
     形狀不符會依 rows() 的規則明確失敗，而不是靜默吞掉。"""
     return rows(call(sess, "api/commonConfig/list", body=_base_body(sess), **kw))
+
+
+# --- 寫入層（1.9.3 實測格式；預設關閉，無 checksum）---------------------------
+#
+# 設計見 references/write-api-conversion-assessment.md。四個前提：
+#   1) 雙重開關：需 confirm=True 且環境變數 ARK_API_WRITES=1，否則連送都不送。
+#   2) 無 checksum：mitm 實測寫入不帶任何簽章，Bearer token + deviceToken 即可。
+#   3) read-after-write：寫完立刻用唯讀 API 讀回比對，不符即拋（取代 AX 的「總成本」見證）。
+#   4) 只動台股（type/market 預設 "1"）；券商下單不在此層，維持 Shioaji。
+
+WRITES_ENABLED_ENV = "ARK_API_WRITES"
+
+# 僅供文件／測試對照：實測攔到的寫入端點模板（參數位置見註解）
+WRITE_ENDPOINTS = {
+    "api/myStock/insert",                                            # body: stock_code,type,market,totle_count,avg_price,member_id
+    "api/myStock/update/{member_id}/{code}/{kind}/{qty}/{avgPrice}",  # 參數在 path，body {}
+    "api/myStock/avgPrice/upsert",                                   # body: member_id,stock_code,data_date,avg_price
+    "api/myStock/delete/{member_id}/{code}/{kind}",                  # 參數在 path
+    "api/calculateRisk/memberMoney/update",                          # body: member_id,amount_twd,amount_usd
+}
+
+
+class WritesDisabled(PermissionError):
+    pass
+
+
+def _require_writes_enabled(confirm):
+    if not confirm:
+        raise WritesDisabled("寫入需 confirm=True（避免誤呼叫）")
+    if os.environ.get(WRITES_ENABLED_ENV) != "1":
+        raise WritesDisabled(f"寫入預設關閉：請設環境變數 {WRITES_ENABLED_ENV}=1 才會真的送出")
+
+
+def _numstr(v):
+    """ARK 寫入欄位要字串；整數不帶小數、其餘保留兩位。"""
+    f = float(v)
+    return str(int(f)) if f == int(f) else f"{f:.2f}"
+
+
+def _qtystr(q):
+    """股數：ARK path／body 用一位小數的浮點字串（實測如 '32.0'、'1.0'）。"""
+    return str(float(q))
+
+
+def _write_post(sess, path, body=None, query=None, fetch=_fetch, now=None):
+    """送出一次寫入 POST（不經 READ_ONLY 白名單——寫入由各具名函式自己把關）。
+    code 非 0000 即拋。呼叫端負責 read-after-write 驗證。"""
+    if not token_valid(sess.token, now=now):
+        raise ArkApiError(f"登入憑證已於 {sess.expires:%Y-%m-%d %H:%M} 過期，"
+                          "請開啟方舟運算讓它重新登入")
+    params = {"deviceType": "I", "deviceToken": sess.device_token, **(query or {})}
+    url = BASE + path + "?" + urllib.parse.urlencode(params)
+    headers = {"Authorization": f"Bearer {sess.token}", "Accept": "*/*",
+               "Content-Type": "application/json"}
+    resp = fetch(url, headers, body if body is not None else {})   # body None 也送 {} 以走 POST
+    if resp.get("code") != "0000":
+        raise ArkApiError(f"寫入未成功 code={resp.get('code')}：{resp.get('message')}")
+    return resp
+
+
+def set_cash(sess, twd, usd=None, *, confirm=False, verify=True, fetch=_fetch, now=None):
+    """改運算頁現金。usd 省略時先讀回目前美元現金保留，避免被歸零（端點同時帶台幣與美元）。
+    verify=True：寫入後讀回 cash() 比對台幣。"""
+    _require_writes_enabled(confirm)
+    if usd is None:
+        _, usd = cash(sess, fetch=fetch, now=now)
+    body = {**_base_body(sess), "member_id": sess.member_id,
+            "amount_twd": str(int(round(twd))), "amount_usd": _numstr(usd)}
+    resp = _write_post(sess, "api/calculateRisk/memberMoney/update", body=body, fetch=fetch, now=now)
+    if verify:
+        got_twd, _ = cash(sess, fetch=fetch, now=now)
+        if abs(got_twd - round(twd)) > 0.5:
+            raise ArkApiError(f"寫入後讀回台幣現金 {got_twd} 與目標 {round(twd)} 不符，視為未生效")
+    return resp
+
+
+def insert_holding(sess, code, qty, avg_price, *, kind="1", market="1",
+                   confirm=False, verify=True, fetch=_fetch, now=None):
+    """新增一檔台股庫存。code 已存在時 ARK 會回非 0000（請改用 update_holding）。"""
+    _require_writes_enabled(confirm)
+    body = {**_base_body(sess), "member_id": sess.member_id, "stock_code": code,
+            "type": kind, "market": market, "totle_count": _qtystr(qty),
+            "avg_price": _numstr(avg_price)}      # 注意 ARK 欄位拼法為 totle_count
+    resp = _write_post(sess, "api/myStock/insert", body=body, fetch=fetch, now=now)
+    if verify:
+        pos = positions(sess, fetch=fetch, now=now)
+        if code not in pos or pos[code][0] != int(float(qty)):
+            raise ArkApiError(f"寫入後讀回未見 {code} 股數 {int(float(qty))}，視為未生效")
+    return resp
+
+
+def update_holding(sess, code, qty, avg_price, *, kind="1",
+                   confirm=False, verify=True, fetch=_fetch, now=None):
+    """改一檔台股的股數／均價。實測是兩支：update（path 參數、body {}）＋ avgPrice/upsert。"""
+    _require_writes_enabled(confirm)
+    path = f"api/myStock/update/{sess.member_id}/{code}/{kind}/{_qtystr(qty)}/{_numstr(avg_price)}"
+    resp = _write_post(sess, path, body={}, fetch=fetch, now=now)
+    _write_post(sess, "api/myStock/avgPrice/upsert",
+                body={**_base_body(sess), "member_id": sess.member_id, "stock_code": code,
+                      "data_date": dt.datetime.now().strftime("%Y%m%d"),
+                      "avg_price": _numstr(avg_price)}, fetch=fetch, now=now)
+    if verify:
+        pos = positions(sess, fetch=fetch, now=now)
+        got = pos.get(code)
+        if not got or got[0] != int(float(qty)) or abs(got[1] - float(avg_price)) > 0.01:
+            raise ArkApiError(f"寫入後讀回 {code}={got} 與目標 ({int(float(qty))}, {avg_price}) 不符")
+    return resp
+
+
+def delete_holding(sess, code, *, kind="1", confirm=False, verify=True, fetch=_fetch, now=None):
+    """刪一檔台股庫存。參數在 path。"""
+    _require_writes_enabled(confirm)
+    resp = _write_post(sess, f"api/myStock/delete/{sess.member_id}/{code}/{kind}",
+                       body={}, fetch=fetch, now=now)
+    if verify and code in positions(sess, fetch=fetch, now=now):
+        raise ArkApiError(f"寫入後讀回 {code} 仍在庫存，刪除視為未生效")
+    return resp
