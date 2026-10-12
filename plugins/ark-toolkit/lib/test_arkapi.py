@@ -5,6 +5,7 @@
 import base64
 import datetime as dt
 import json
+import os
 import unittest
 
 import arkapi
@@ -189,6 +190,157 @@ class TestReadOnlyGuard(unittest.TestCase):
 
         with self.assertRaises(arkapi.ArkApiError):
             arkapi.call(sess, "api/calculateRisk", fetch=fetch, now=NOW)
+
+
+class TestNewReadOnlyEndpoints(unittest.TestCase):
+    """1.9.3 新增的唯讀查詢。端點、body 與回應欄位都取自 App 自己呼叫過、留在 URL
+    快取裡的紀錄（非猜測），這裡用假 fetch 驗證：路徑進得了白名單、body／query 組對、
+    回應解析正確。寫入端點與 api/auth 刻意不收進唯讀層。"""
+
+    def _sess(self):
+        token = jwt(NOW + dt.timedelta(hours=1))
+        return arkapi.Session(token, "20260313220729978000", "dev", NOW + dt.timedelta(hours=1))
+
+    def _fetch(self, store):
+        def fetch(url, headers, body):
+            store["url"], store["body"] = url, body
+            return store["resp"]
+        return fetch
+
+    def test_目前點數取當前點數欄位(self):
+        s = {"resp": {"code": "0000",
+                      "title": ["會員序號", "當前點數", "AuthType", "是否為教練 1:是 0:否"],
+                      "data": [["x", "1,250", "1", "0"]]}}
+        self.assertEqual(arkapi.points(self._sess(), fetch=self._fetch(s), now=NOW), 1250.0)
+        self.assertIn("api/pointRecord/getCurrentPoint?", s["url"])
+        self.assertIn("memberId=", s["url"])
+
+    def test_匯率(self):
+        s = {"resp": {"code": "0000", "title": ["匯率"], "data": [["32.15"]]}}
+        self.assertEqual(arkapi.exchange_rate(self._sess(), fetch=self._fetch(s), now=NOW), 32.15)
+
+    def test_每日資產帶日期區間與member_id(self):
+        s = {"resp": {"code": "0000", "title": ["資料日期", "股票庫存總市值", "現金餘額"],
+                      "data": [["20261007", "100", "5"], ["20261008", "110", "5"]]}}
+        got = arkapi.asset_daily(self._sess(), "20261007", dt.date(2026, 10, 10),
+                                 fetch=self._fetch(s), now=NOW)
+        self.assertEqual(len(got), 2)
+        self.assertEqual(got[0]["資料日期"], "20261007")
+        self.assertEqual(s["body"]["start_date"], "20261007")
+        self.assertEqual(s["body"]["end_date"], "20261010")       # date → YYYYMMDD
+        self.assertEqual(s["body"]["member_id"], "20260313220729978000")
+
+    def test_策略清單(self):
+        s = {"resp": {"code": "0000", "title": ["策略ID", "策略名稱"],
+                      "data": [["10", "產業價值區"], ["6", "產業升溫區"]]}}
+        ids = arkapi.strategy_ids(self._sess(), fetch=self._fetch(s), now=NOW)
+        self.assertEqual(ids[0]["策略名稱"], "產業價值區")
+
+    def test_個股資料把symbols放進body(self):
+        s = {"resp": {"code": "0000",
+                      "title": ["股票代號", "K(9)", "淨值", "折溢價", "成交量", "成交金額"],
+                      "data": [["00631L", "85", "1.2", "0.1", "100", "200"]]}}
+        got = arkapi.stock_data(self._sess(), ["00631L", "0050"], fetch=self._fetch(s), now=NOW)
+        self.assertEqual(got[0]["股票代號"], "00631L")
+        self.assertEqual(s["body"]["symbols"], ["00631L", "0050"])
+
+    def test_auth端點不在白名單_唯讀層不自行換發token(self):
+        with self.assertRaises(ValueError):
+            arkapi.call(self._sess(), "api/auth", body={}, fetch=lambda *a, **k: {}, now=NOW)
+
+
+class TestWriteLayer(unittest.TestCase):
+    """寫入層（1.9.3 mitm 實測格式）：雙開關守衛、path／body 組法、read-after-write。
+    全程用假 fetch，不連網、不動任何帳戶。"""
+
+    def setUp(self):
+        self._prev = os.environ.get(arkapi.WRITES_ENABLED_ENV)
+        os.environ[arkapi.WRITES_ENABLED_ENV] = "1"
+
+    def tearDown(self):
+        if self._prev is None:
+            os.environ.pop(arkapi.WRITES_ENABLED_ENV, None)
+        else:
+            os.environ[arkapi.WRITES_ENABLED_ENV] = self._prev
+
+    def _sess(self):
+        token = jwt(NOW + dt.timedelta(hours=1))
+        return arkapi.Session(token, "20260313220729978000", "dev", NOW + dt.timedelta(hours=1))
+
+    def _fetch(self, *, positions=None, cash=(0.0, 0.0), sent=None):
+        positions = positions or {}
+
+        def fetch(url, headers, body):
+            if sent is not None:
+                sent.append((url, body))
+            if "memberMoney/update" in url:
+                return {"code": "0000", "message": "操作成功"}
+            if "calculateRisk/memberMoney" in url:                      # 現金讀回
+                return {"code": "0000", "title": ["台幣金額", "美元金額"],
+                        "data": [str(cash[0]), str(cash[1])]}
+            if ("/myStock/insert" in url or "/myStock/update/" in url
+                    or "avgPrice/upsert" in url or "/myStock/delete/" in url):
+                return {"code": "0000", "message": "操作成功"}
+            if "/api/myStock/" in url:                                  # 庫存讀回
+                tw = [[c, "1", str(float(q)), str(p), "0", "t"] for c, (q, p) in positions.items()]
+                return {"code": "0000",
+                        "title": ["股票代號", "種類", "總股數", "成交均價", "排序", "建立時間"],
+                        "data": {"twStock": tw, "usStock": []}}
+            return {"code": "0000"}
+        return fetch
+
+    def test_寫入預設關閉_需旗標與confirm(self):
+        sess = self._sess()
+        os.environ.pop(arkapi.WRITES_ENABLED_ENV, None)                 # 沒有旗標
+        with self.assertRaises(arkapi.WritesDisabled):
+            arkapi.set_cash(sess, 5000, usd=0, confirm=True, fetch=self._fetch(), now=NOW)
+        os.environ[arkapi.WRITES_ENABLED_ENV] = "1"                     # 有旗標但沒 confirm
+        with self.assertRaises(arkapi.WritesDisabled):
+            arkapi.set_cash(sess, 5000, usd=0, confirm=False, fetch=self._fetch(), now=NOW)
+
+    def test_set_cash_送memberMoney_update並讀回驗證(self):
+        sent = []
+        f = self._fetch(cash=(5000.0, 0.0), sent=sent)
+        arkapi.set_cash(self._sess(), 5000, usd=0, confirm=True, fetch=f, now=NOW)
+        upd = next(b for u, b in sent if "memberMoney/update" in u)
+        self.assertEqual(upd["amount_twd"], "5000")
+        self.assertEqual(upd["member_id"], "20260313220729978000")
+
+    def test_set_cash_省略usd時保留原本美元(self):
+        sent = []
+        f = self._fetch(cash=(5000.0, 123.0), sent=sent)               # 現有美元 123
+        arkapi.set_cash(self._sess(), 5000, confirm=True, fetch=f, now=NOW)  # usd 省略
+        upd = next(b for u, b in sent if "memberMoney/update" in u)
+        self.assertEqual(upd["amount_usd"], "123")                     # 不被歸零
+
+    def test_insert_holding_body與驗證(self):
+        sent = []
+        f = self._fetch(positions={"2313": (1, 200.0)}, sent=sent)
+        arkapi.insert_holding(self._sess(), "2313", 1, 200, confirm=True, fetch=f, now=NOW)
+        ins = next(b for u, b in sent if "/myStock/insert" in u)
+        self.assertEqual(ins["stock_code"], "2313")
+        self.assertEqual(ins["totle_count"], "1.0")
+        self.assertEqual(ins["avg_price"], "200")
+        self.assertEqual((ins["type"], ins["market"]), ("1", "1"))
+
+    def test_update_holding_走path參數並打avgPrice_upsert(self):
+        sent = []
+        f = self._fetch(positions={"00935": (33, 62.76)}, sent=sent)
+        arkapi.update_holding(self._sess(), "00935", 33, 62.76, confirm=True, fetch=f, now=NOW)
+        urls = [u for u, _ in sent]
+        self.assertTrue(any("/myStock/update/20260313220729978000/00935/1/33.0/62.76" in u for u in urls))
+        self.assertTrue(any("avgPrice/upsert" in u for u in urls))
+
+    def test_delete_holding_走path並驗證消失(self):
+        sent = []
+        f = self._fetch(positions={}, sent=sent)                       # 刪後讀回已無
+        arkapi.delete_holding(self._sess(), "2313", confirm=True, fetch=f, now=NOW)
+        self.assertTrue(any("/myStock/delete/20260313220729978000/2313/1" in u for u, _ in sent))
+
+    def test_寫入後讀回不符就拋(self):
+        f = self._fetch(positions={})                                  # insert 後卻讀不到該檔
+        with self.assertRaises(arkapi.ArkApiError):
+            arkapi.insert_holding(self._sess(), "2313", 1, 200, confirm=True, fetch=f, now=NOW)
 
 
 if __name__ == "__main__":

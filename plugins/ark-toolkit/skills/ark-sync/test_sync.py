@@ -1388,3 +1388,109 @@ class TestWaitFor(unittest.TestCase):
         fake = self.FlakyAx(missing_polls=10_000, page="watchlist")
         with self.assertRaises(self.FlakyAx.ArkNotRunning):
             ark.wait_for(fake, 1, lambda w: True, "回主頁", timeout=0.05)
+
+
+class TestChooseCurrent(unittest.TestCase):
+    """本版把 ARK 現況主來源從畫面(AX)改為 API；choose_current 定義兩者的取捨與交叉驗證。"""
+
+    A = {"0050": (17, 96.76), "2330": (50, 1000.0)}
+
+    def test_兩來源一致時以API為權威(self):
+        current, src, ok, mismatch = sync.choose_current(self.A, dict(self.A))
+        self.assertTrue(ok)
+        self.assertIsNone(mismatch)
+        self.assertEqual(current, self.A)
+        self.assertIn("API", src)
+
+    def test_兩來源不一致時停手不寫入(self):
+        ax_pos = {"0050": (17, 96.76), "2330": (49, 1000.0)}   # 畫面少 1 股
+        current, src, ok, mismatch = sync.choose_current(self.A, ax_pos)
+        self.assertFalse(ok)
+        self.assertIsNone(current)        # ok=False → current 為 None，呼叫端據此 return 1
+        self.assertIn("2330", mismatch)
+
+    def test_只有API時用API_畫面見證缺席不擋(self):
+        current, src, ok, _ = sync.choose_current(self.A, None)
+        self.assertTrue(ok)
+        self.assertEqual(current, self.A)
+        self.assertEqual(src, "API")
+
+    def test_API不可用時回退畫面(self):
+        current, src, ok, _ = sync.choose_current(None, self.A)
+        self.assertTrue(ok)
+        self.assertEqual(current, self.A)
+        self.assertIn("AX", src)
+
+    def test_兩邊都讀不到則停手(self):
+        current, src, ok, mismatch = sync.choose_current(None, None)
+        self.assertFalse(ok)
+        self.assertIsNone(current)
+        self.assertTrue(mismatch)
+
+
+class TestWriteBackend(unittest.TestCase):
+    """寫入後端切換：ARK_API_WRITES=1 → apply_write 走 arkapi 寫入函式；否則走畫面(AX)。
+    全程以假物件替身，不連網、不碰 ARK。"""
+
+    def test_writes_use_api_讀環境變數(self):
+        prev = os.environ.get("ARK_API_WRITES")
+        try:
+            os.environ["ARK_API_WRITES"] = "1"
+            self.assertTrue(sync.writes_use_api())
+            os.environ["ARK_API_WRITES"] = "0"
+            self.assertFalse(sync.writes_use_api())
+            os.environ.pop("ARK_API_WRITES", None)
+            self.assertFalse(sync.writes_use_api())
+        finally:
+            if prev is None:
+                os.environ.pop("ARK_API_WRITES", None)
+            else:
+                os.environ["ARK_API_WRITES"] = prev
+
+    def test_api後端呼叫arkapi寫入函式(self):
+        import arkapi
+        calls = []
+        orig = (arkapi.insert_holding, arkapi.update_holding, arkapi.delete_holding)
+        arkapi.insert_holding = lambda s, c, q, p, **k: calls.append(("insert", c, q, p))
+        arkapi.update_holding = lambda s, c, q, p, **k: calls.append(("update", c, q, p))
+        arkapi.delete_holding = lambda s, c, **k: calls.append(("delete", c))
+        try:
+            sess = object()
+            self.assertTrue(sync.apply_write("add", "2313", 1, 200, None, None, sess))
+            self.assertTrue(sync.apply_write("update", "0050", 10, 50.0, None, None, sess))
+            self.assertTrue(sync.apply_write("delete", "0056", 0, 0.0, None, None, sess))
+        finally:
+            arkapi.insert_holding, arkapi.update_holding, arkapi.delete_holding = orig
+        self.assertEqual(calls, [("insert", "2313", 1, 200),
+                                 ("update", "0050", 10, 50.0), ("delete", "0056")])
+
+    def test_api寫入丟例外時回False進重試(self):
+        import arkapi
+        orig = arkapi.insert_holding
+
+        def boom(*a, **k):
+            raise arkapi.ArkApiError("讀回不符")
+
+        arkapi.insert_holding = boom
+        try:
+            self.assertFalse(sync.apply_write("add", "2313", 1, 200, None, None, object()))
+        finally:
+            arkapi.insert_holding = orig
+
+    def test_ax後端呼叫畫面寫入函式(self):
+        calls = []
+        orig = (sync.update_holding, sync.add_holding, sync.delete_holding)
+        sync.update_holding = lambda ax, pid, c, q, p: calls.append(("update", c)) or True
+        sync.add_holding = lambda ax, pid, c, q, p: calls.append(("add", c)) or True
+        sync.delete_holding = lambda ax, pid, c: calls.append(("delete", c)) or True
+        try:
+            sync.apply_write("add", "2313", 1, 200, "AX", "PID", None)
+            sync.apply_write("update", "0050", 10, 50.0, "AX", "PID", None)
+            sync.apply_write("delete", "0056", 0, 0.0, "AX", "PID", None)
+        finally:
+            sync.update_holding, sync.add_holding, sync.delete_holding = orig
+        self.assertEqual(calls, [("add", "2313"), ("update", "0050"), ("delete", "0056")])
+
+
+if __name__ == "__main__":
+    unittest.main()

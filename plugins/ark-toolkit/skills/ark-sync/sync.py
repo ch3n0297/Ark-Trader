@@ -46,13 +46,15 @@ def check_platform(platform=None):
 def server_positions():
     """ARK 伺服器上的庫存 {代號: (股數, 均價)}；讀不到回 None（不是錯誤）。
 
-    走 App 自己的登入憑證，唯讀。App 沒開、token 過期、沒網路都只是「這次沒得對」。
+    走 App 自己的登入憑證，唯讀、無畫面、不受翻頁／列解析脆弱性影響，所以自本版起
+    當作 ARK 現況的**主來源**（見 choose_current）。App 沒開、token 過期、沒網路時
+    回 None，呼叫端自動回退為畫面(AX)主讀。
     """
     try:
         import arkapi
         return arkapi.positions(arkapi.session())
-    except Exception as e:                    # noqa: BLE001 - 輔助檢查，任何失敗都只是跳過
-        print(f"  （跳過伺服器對帳：{e}）", flush=True)
+    except Exception as e:                    # noqa: BLE001 - 讀不到就回退畫面，不是致命錯
+        print(f"  （API 讀取庫存不可用，改用畫面：{e}）", flush=True)
         return None
 
 
@@ -72,6 +74,34 @@ def cross_check(current, server):
         if a is None or b is None or a[0] != b[0] or abs(a[1] - b[1]) >= ark.PRICE_TOL:
             bad.append(f"{code}: 畫面 {a} vs 伺服器 {b}")
     return (False, "、".join(bad)) if bad else (True, None)
+
+
+def choose_current(api_positions, ax_positions):
+    """決定要用哪一份當 ARK 的權威現況，並在兩份都在時交叉驗證。
+
+    本版把主來源從畫面(AX)翻頁讀取改為 API（server_positions）：API 唯讀、無畫面、
+    不受 1.8.0／1.8.1 那類翻頁漏列或列格式改版的影響。畫面讀取降為**獨立見證**——
+    API 在時仍讀一次畫面比對，用的是 1.6.1 以來一路守著的「兩個獨立來源」安全網，
+    只是把權威那一方換成 API。
+
+    參數都是 {代號:(股數,均價)} 或 None：
+      api_positions  API 讀到的，或 None（App 沒開／token 過期／沒網路）
+      ax_positions   畫面讀到的，或 None（API 當家時畫面讀失敗就略過見證，不強讀）
+
+    回傳 (current, source, ok, mismatch)：
+      current   權威現況；ok 為 False 時給 None（呼叫端據此停手、不寫入）
+      source    印給使用者看的來源說明
+      ok        是否可繼續
+      mismatch  不可繼續時的原因（兩來源不符，或兩邊都讀不到）
+    """
+    if api_positions is not None and ax_positions is not None:
+        ok, mismatch = cross_check(ax_positions, api_positions)   # 比對對稱，誰當誰無妨
+        return (api_positions if ok else None), "API（畫面交叉驗證）", ok, mismatch
+    if api_positions is not None:
+        return api_positions, "API", True, None
+    if ax_positions is not None:
+        return ax_positions, "畫面(AX)", True, None
+    return None, "無", False, "API 與畫面都讀不到 ARK 現況"
 
 
 def plan_changes(current, target):
@@ -383,6 +413,37 @@ def describe(plan):
     return "\n".join(lines)
 
 
+def writes_use_api():
+    """寫入是否走 arkapi（需環境變數 ARK_API_WRITES=1）；否則走畫面(AX)。
+    讀取在 1.9.0 已是 API 主來源；寫入預設仍走 AX（有 App 自算「總成本」當見證），
+    設此旗標才改走 arkapi 的寫入函式（它們內建 read-after-write 讀回驗證）。"""
+    return os.environ.get("ARK_API_WRITES") == "1"
+
+
+def apply_write(action, code, qty, price, ax, pid, api_sess):
+    """套用一筆庫存變更。api_sess 非 None 走 arkapi 寫入函式（內建 read-after-write 驗證），
+    否則走畫面(AX)。回傳是否成功；API 失敗（含讀回不符）回 False，交給上層重試一輪，
+    與 AX 路徑的失敗語意一致。"""
+    if api_sess is not None:
+        import arkapi
+        try:
+            if action == "update":
+                arkapi.update_holding(api_sess, code, qty, price, confirm=True)
+            elif action == "add":
+                arkapi.insert_holding(api_sess, code, qty, price, confirm=True)
+            else:
+                arkapi.delete_holding(api_sess, code, confirm=True)
+            return True
+        except Exception as e:                 # noqa: BLE001 - 與 AX 路徑一致：失敗回 False
+            print(f"    ✗ API 寫入失敗：{e}")
+            return False
+    if action == "update":
+        return update_holding(ax, pid, code, qty, price)
+    if action == "add":
+        return add_holding(ax, pid, code, qty, price)
+    return delete_holding(ax, pid, code)
+
+
 def main():
     ap = argparse.ArgumentParser(description="把 ARK 台股庫存同步成真實持倉（來源由 ark-setup 設定）")
     ap.add_argument("--dry-run", action="store_true", help="只顯示差異，不做任何寫入")
@@ -427,18 +488,33 @@ def main():
 
     pid = ax.ensure_ready()       # 不搶焦點：ARK 視窗可見即可，使用者可繼續用電腦
     pid = ark.ensure_responsive(ax, pid)   # 殭屍態（事件層死掉）在這裡自癒
-    print("讀取 ARK 庫存…")
-    holdings = ark.read_holdings(ax, pid)
-    declared = ark.read_declared_count(ax, pid)
-    check_parsed(holdings, declared)                 # 與 App 宣告的檔數交叉驗證
-    print(f"  ARK {len(holdings)} 檔" + (f"（App 宣告 {declared} 檔）" if declared else ""))
 
-    current = {code: (h.qty, h.price) for code, h in holdings.items()}
-    ok, mismatch = cross_check(current, server_positions())
+    # ARK 現況主來源 = API（唯讀、無畫面、不受翻頁／列解析脆弱性影響）。
+    # 畫面(AX)讀取降為獨立見證：API 在就讀一次畫面比對，讀失敗不擋；
+    # API 不可用時回退為原本的畫面主讀（含 App 宣告檔數交叉驗證）。
+    print("讀取 ARK 庫存…")
+    server = server_positions()
+    ax_positions = None
+    if server is not None:
+        try:
+            holdings = ark.read_holdings(ax, pid)
+            ax_positions = {code: (h.qty, h.price) for code, h in holdings.items()}
+        except Exception as e:                    # noqa: BLE001 - 見證讀不到不擋，API 已是權威
+            print(f"  （畫面見證略過：{e}）")
+    else:
+        holdings = ark.read_holdings(ax, pid)
+        declared = ark.read_declared_count(ax, pid)
+        check_parsed(holdings, declared)          # 回退路徑：與 App 宣告的檔數交叉驗證
+        ax_positions = {code: (h.qty, h.price) for code, h in holdings.items()}
+        if declared:
+            print(f"  App 宣告 {declared} 檔")
+
+    current, src, ok, mismatch = choose_current(server, ax_positions)
     if not ok:
-        print(f"🛑 畫面讀到的庫存與 ARK 伺服器不符，可能是解析器壞了：{mismatch}", file=sys.stderr)
+        print(f"🛑 讀取 ARK 現況失敗：{mismatch}", file=sys.stderr)
         print("   在弄清楚之前不做任何寫入。", file=sys.stderr)
         return 1
+    print(f"  ARK {len(current)} 檔（來源：{src}）")
     plan = plan_changes(current, target)
     if plan:
         print(f"\n需要 {len(plan)} 項變更：")
@@ -454,56 +530,75 @@ def main():
             return 2
         print("    --force 已指定，繼續執行。")
 
+    # 寫入後端：預設畫面(AX)；ARK_API_WRITES=1 時改走 arkapi 寫入函式（內建 read-after-write）。
+    # dry-run 不寫入，不必取 session。
+    api_sess = None
+    if writes_use_api() and not args.dry_run:
+        try:
+            import arkapi
+            api_sess = arkapi.session()
+            print("寫入後端：API（ARK_API_WRITES=1，read-after-write 驗證；AX 不介入寫入）")
+        except Exception as e:                   # noqa: BLE001
+            print(f"🛑 指定了 API 寫入（ARK_API_WRITES=1）但取不到登入憑證：{e}", file=sys.stderr)
+            print("   不寫入。請開啟方舟運算讓它登入，或 unset ARK_API_WRITES 改走畫面。",
+                  file=sys.stderr)
+            return 1
+
     if not plan:
         print("\n✅ 庫存已完全一致，無需變更")
         if not cash_step_needed(args.with_cash, args.dry_run):
             return 0
-        return 0 if sync_cash(ax, pid, cfg) else 1
+        return 0 if sync_cash(ax, pid, cfg, api_sess) else 1
 
     if args.dry_run:
-        print("\n（dry-run，未做任何寫入）")
+        backend = "API（ARK_API_WRITES=1）" if writes_use_api() else "畫面(AX)"
+        print(f"\n（dry-run，未做任何寫入；實際執行時寫入後端將為 {backend}）")
         return 0
 
     skipped = [c for a, c, *_ in plan if a == "delete" and not args.allow_delete]
     if skipped:
         print(f"\n略過刪除 {len(skipped)} 檔（需要 --allow-delete）：{', '.join(skipped)}")
 
-    print("\n開始執行…")
-    ark.enter_edit_page(ax, pid)
+    print("\n開始執行…" + ("（API 寫入）" if api_sess else "（畫面寫入）"))
+    if api_sess is None:
+        ark.enter_edit_page(ax, pid)             # API 寫入不碰編輯頁
     ok = 0
     applied = []
     todo = [(a, c, q, p) for a, c, q, p, _cur in plan
             if not (a == "delete" and not args.allow_delete)]
     for attempt in (1, 2):
         # 失敗項重試一輪：AX 操作偶發失手（實例：2026-08-11 的 00635U 刪除），
-        # 同樣的操作重跑一次多半就過；仍失敗才回報，交給收尾的 --dry-run 複驗
+        # 同樣的操作重跑一次多半就過；API 失敗（含 read-after-write 不符）也同樣重試一次
         failed = []
         for action, code, qty, price in todo:
             print(f"  {action} {code}" + ("（重試）" if attempt == 2 else ""))
-            if action == "update":
-                done = update_holding(ax, pid, code, qty, price)
-            elif action == "add":
-                done = add_holding(ax, pid, code, qty, price)
-            else:
-                done = delete_holding(ax, pid, code)
+            done = apply_write(action, code, qty, price, ax, pid, api_sess)
             if done:
                 ok += 1
                 applied.append([action, code])
                 print(f"    ✅ {code} 完成")
             else:
                 failed.append((action, code, qty, price))
-            ark.enter_edit_page(ax, pid)  # 每檔後重置列表位置，避免遮擋
+            if api_sess is None:
+                ark.enter_edit_page(ax, pid)  # 僅畫面模式需每檔後重置列表位置，避免遮擋
         todo = failed
         if not todo:
             break
     fail = len(todo)
 
-    after = ark.read_declared_count(ax, pid)     # 用 App 自己宣告的檔數收尾，不用推算的
+    if api_sess is not None:
+        try:
+            import arkapi
+            after = len(arkapi.positions(api_sess))   # API 模式用伺服器庫存檔數收尾
+        except Exception:                             # noqa: BLE001
+            after = None
+    else:
+        after = ark.read_declared_count(ax, pid)     # 畫面模式用 App 自己宣告的檔數收尾
     ark.append_sync_log(log_entry(current, target, applied, ok, fail, after, cfg,
                                   dt.datetime.now().replace(microsecond=0).isoformat()))
 
     print(f"\n完成 {ok} 項，失敗 {fail} 項")
-    if args.with_cash and not sync_cash(ax, pid, cfg):
+    if args.with_cash and not sync_cash(ax, pid, cfg, api_sess):
         fail += 1
     print("建議執行 --dry-run 再確認一次結果。")
     return 1 if fail else 0
@@ -519,12 +614,15 @@ def cash_step_needed(with_cash, dry_run):
     return bool(with_cash) and not dry_run
 
 
-def sync_cash(ax, pid, cfg):
+def sync_cash(ax, pid, cfg, api_sess=None):
     """把運算頁台幣現金欄同步成券商可動用資金（＋帳戶外現金）。回傳是否成功。
 
     ARK 用這個數字算建議比例與參考調節，官方教學：「現金輸錯，整個方向都反」。
     帳戶外的錢系統看不到，由 config.json 的 `external_cash` 帶入——沒設就是 0，
     此時填進去的只有券商那部分，若你實際還有別的錢，建議去設定。
+
+    api_sess 非 None 時走 arkapi.set_cash（read-after-write 讀回驗證、保留美元現金），
+    否則走畫面(AX) write_posture_cash。
     """
     import shioaji as sj
 
@@ -545,6 +643,15 @@ def sync_cash(ax, pid, cfg):
     print(f"\n同步運算頁現金欄 → {target:,.0f}"
           f"（券商 {balance:,.0f}＋未交割 {settlements['t1'] + settlements['t2']:,.0f}"
           f"＋帳戶外 {external:,.0f}）")
+    if api_sess is not None:
+        import arkapi
+        try:
+            arkapi.set_cash(api_sess, target, confirm=True)   # usd 省略→保留原美元現金
+            print("  ✅ 已寫入（API，讀回驗證通過）")
+            return True
+        except Exception as e:                                # noqa: BLE001
+            print(f"  ✗ API 寫入現金失敗：{e}——後續決策應視為失效保護條件，不交易")
+            return False
     if ark.write_posture_cash(ax, pid, target):
         print("  ✅ 已寫入")
         return True
