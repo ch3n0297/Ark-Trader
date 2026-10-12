@@ -38,9 +38,17 @@ READ_ONLY = {
     "api/calculateRisk",                 # 五指標 + 持股水位建議（AX 讀不到的儀表板）
     "api/calculateRisk/memberMoney",     # 台幣／美元現金
     "api/myStock/{member_id}",           # 庫存
+    "api/myStock/assetDaily",            # 每日總資產序列（庫存市值＋現金餘額）
+    "api/pointRecord/getCurrentPoint",   # 目前點數（教練／會員）
+    "api/stockData",                     # 一批代號的盤中資料（K(9)／淨值／折溢價…）
+    "api/stockData/exchangeRate",        # 美元兌台幣匯率
+    "api/commonConfig/list",             # App 共用設定清單
     "api/st/ids",                        # 策略分區清單
     "api/st/{zone_id}",                  # 策略分區內容（產業價值區 10、產業升溫區 6…）
 }
+# 上面 assetDaily／getCurrentPoint／stockData／exchangeRate／commonConfig 五個端點與其
+# 回應欄位，取自 App 1.9.3 自己呼叫過、留在 URL 快取裡的紀錄（非猜測）。api/auth（換發
+# token，body 帶 appId／appSecret）刻意不列——見模組開頭「認證」段：唯讀層不自行換發。
 EXPIRY_MARGIN = dt.timedelta(seconds=60)   # 剩這麼點時間就別開始了
 
 
@@ -278,3 +286,59 @@ def parse_zone(payload):
 def zone(sess, zone_id, body=None, **kw):
     # 伺服器對這個端點只接受 POST，空 body 即可；GET 回 405
     return parse_zone(call(sess, f"api/st/{zone_id}", body={} if body is None else body, **kw))
+
+
+# --- 1.9.3 新增的唯讀查詢（端點、body、回應欄位均取自 App 自己的快取紀錄）---------
+
+def _base_body(sess):
+    """多數 POST 查詢共同的 body；App 實測每筆都帶這兩個欄位。"""
+    return {"deviceType": "I", "deviceToken": sess.device_token}
+
+
+def _ymd(d):
+    """日期正規化成 ARK 用的 'YYYYMMDD'；已是字串就原樣送出（不臆測格式）。"""
+    if isinstance(d, str):
+        return d
+    if isinstance(d, (dt.date, dt.datetime)):
+        return d.strftime("%Y%m%d")
+    raise ValueError(f"日期要給 'YYYYMMDD' 字串或 date，而不是 {type(d).__name__}")
+
+
+def strategy_ids(sess, **kw):
+    """策略分區清單：[{策略ID, 策略名稱}]。zone() 吃的 zone_id 就是這裡的策略ID；
+    目前程式用的產業價值區／升溫區（INDUSTRY_VALUE／INDUSTRY_HEATING）也在這份清單裡。"""
+    return rows(call(sess, "api/st/ids", body=_base_body(sess), **kw))
+
+
+def points(sess, **kw):
+    """目前點數。回應同列還有會員序號／AuthType／是否教練，需要時用 rows() 自取。"""
+    got = rows(call(sess, "api/pointRecord/getCurrentPoint",
+                    query={"memberId": sess.member_id}, **kw))
+    return _num(got[0]["當前點數"]) if got else 0.0
+
+
+def exchange_rate(sess, **kw):
+    """美元兌台幣匯率——App 混合台／美股估值時用的那個數。"""
+    got = rows(call(sess, "api/stockData/exchangeRate", body=_base_body(sess), **kw))
+    return _num(got[0]["匯率"]) if got else 0.0
+
+
+def asset_daily(sess, start, end, **kw):
+    """每日總資產序列：[{資料日期, 股票庫存總市值, 現金餘額}]。值原樣保留字串，
+    要畫圖或算報酬再由呼叫端轉數值。start／end 收 'YYYYMMDD' 或 date。"""
+    body = {**_base_body(sess), "member_id": sess.member_id,
+            "start_date": _ymd(start), "end_date": _ymd(end)}
+    return rows(call(sess, "api/myStock/assetDaily", body=body, **kw))
+
+
+def stock_data(sess, symbols, **kw):
+    """一批代號的盤中資料：[{股票代號, K(9), 淨值, 折溢價, 成交量, 成交金額}]。
+    symbols 是台股代號字串陣列（如 '00631L'）。"""
+    body = {**_base_body(sess), "symbols": list(symbols)}
+    return rows(call(sess, "api/stockData", body=body, **kw))
+
+
+def common_config(sess, **kw):
+    """App 共用設定清單。撰寫時未對照過實際回應欄位，故走通用 rows()：
+    形狀不符會依 rows() 的規則明確失敗，而不是靜默吞掉。"""
+    return rows(call(sess, "api/commonConfig/list", body=_base_body(sess), **kw))

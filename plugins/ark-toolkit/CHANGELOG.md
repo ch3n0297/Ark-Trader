@@ -3,6 +3,31 @@
 本檔記錄 ark-toolkit 的版本沿革。版本語意：主版號＝正式里程碑，
 次版號＝行為或語意變更，修訂號＝bug 修正。
 
+## [1.9.0] - 2026-10-12
+
+- **ark-sync 的 ARK 現況主來源改為 API**。原本以調節庫存頁翻頁（`ark.read_holdings`）
+  讀 ARK 現有庫存，再拿 `arkapi.positions` 當交叉驗證；本版對調：主來源改為 API
+  （唯讀、無畫面、不受 1.8.0／1.8.1 那類翻頁漏列或列格式改版影響），畫面讀取降為
+  **獨立見證**——API 在時仍讀一次畫面比對，讀失敗不擋（API 不再依賴列解析器）；
+  兩來源不符仍一律停手不寫入，維持 1.6.1 以來「兩個獨立來源」的安全網。API 不可用
+  （App 沒開／token 過期／沒網路）時自動回退為原本的畫面主讀，含 App 宣告檔數交叉
+  驗證。取捨邏輯收斂到純函式 `sync.choose_current`，附五個案例的回歸測試。
+- **arkapi 補齊五個唯讀端點**（端點、body、回應欄位均取自 App 1.9.3 自己呼叫過、留在
+  URL 快取裡的紀錄，非猜測）：`points`（目前點數）、`exchange_rate`（美元兌台幣匯率）、
+  `asset_daily`（每日總資產序列）、`stock_data`（一批代號的盤中 K9／淨值／折溢價…）、
+  `common_config`（共用設定），外加 `strategy_ids`（策略分區清單）。全部走既有唯讀
+  白名單與 `{code,message,title,data}` 解析。
+- **analyze／packet 維持畫面(AX)讀取**：它們用的是調節庫存頁的完整列（位階、建議調節、
+  損益），API 的 `api/myStock` 只回代號／股數／均價，沒有這些欄位，改 API 會遺失決策
+  依據，故不轉。
+- **寫入與下單維持 AX 不變**：改庫存（新增／修改／刪除）與運算頁現金欄仍走畫面，保留
+  App 自算「總成本」當獨立見證；相應的寫入 API 端點未經驗證，且寫入／下單不可逆，
+  不從唯讀層走——`api/auth`（換發 token，body 帶 appId／appSecret）亦刻意排除於白名單外。
+- **寫入轉 API 評估**：`references/write-api-conversion-assessment.md` 盤點 AX 寫入對應的
+  ARK 端點（`myStock/insert`／`update`／`delete`、`memberMoney/update` 等，取自主程式字串）、
+  釐清「ARK 寫入≠下單」（真正下單走 Shioaji）、提出以 read-after-write 取代「總成本」
+  見證的設計，並列出落地前必須先用 mitm 攔一筆真實寫入以確認 body 與 checksum。
+
 ## [1.8.1] - 2026-10-12
 
 - **修：翻頁讀取等畫面靜止再收集**。`lib/ark.py` 的 `_scroll_until_stable` 每次捲動後

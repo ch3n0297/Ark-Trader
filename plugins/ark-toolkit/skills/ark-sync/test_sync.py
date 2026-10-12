@@ -1388,3 +1388,45 @@ class TestWaitFor(unittest.TestCase):
         fake = self.FlakyAx(missing_polls=10_000, page="watchlist")
         with self.assertRaises(self.FlakyAx.ArkNotRunning):
             ark.wait_for(fake, 1, lambda w: True, "回主頁", timeout=0.05)
+
+
+class TestChooseCurrent(unittest.TestCase):
+    """本版把 ARK 現況主來源從畫面(AX)改為 API；choose_current 定義兩者的取捨與交叉驗證。"""
+
+    A = {"0050": (17, 96.76), "2330": (50, 1000.0)}
+
+    def test_兩來源一致時以API為權威(self):
+        current, src, ok, mismatch = sync.choose_current(self.A, dict(self.A))
+        self.assertTrue(ok)
+        self.assertIsNone(mismatch)
+        self.assertEqual(current, self.A)
+        self.assertIn("API", src)
+
+    def test_兩來源不一致時停手不寫入(self):
+        ax_pos = {"0050": (17, 96.76), "2330": (49, 1000.0)}   # 畫面少 1 股
+        current, src, ok, mismatch = sync.choose_current(self.A, ax_pos)
+        self.assertFalse(ok)
+        self.assertIsNone(current)        # ok=False → current 為 None，呼叫端據此 return 1
+        self.assertIn("2330", mismatch)
+
+    def test_只有API時用API_畫面見證缺席不擋(self):
+        current, src, ok, _ = sync.choose_current(self.A, None)
+        self.assertTrue(ok)
+        self.assertEqual(current, self.A)
+        self.assertEqual(src, "API")
+
+    def test_API不可用時回退畫面(self):
+        current, src, ok, _ = sync.choose_current(None, self.A)
+        self.assertTrue(ok)
+        self.assertEqual(current, self.A)
+        self.assertIn("AX", src)
+
+    def test_兩邊都讀不到則停手(self):
+        current, src, ok, mismatch = sync.choose_current(None, None)
+        self.assertFalse(ok)
+        self.assertIsNone(current)
+        self.assertTrue(mismatch)
+
+
+if __name__ == "__main__":
+    unittest.main()

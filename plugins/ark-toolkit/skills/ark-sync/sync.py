@@ -46,13 +46,15 @@ def check_platform(platform=None):
 def server_positions():
     """ARK 伺服器上的庫存 {代號: (股數, 均價)}；讀不到回 None（不是錯誤）。
 
-    走 App 自己的登入憑證，唯讀。App 沒開、token 過期、沒網路都只是「這次沒得對」。
+    走 App 自己的登入憑證，唯讀、無畫面、不受翻頁／列解析脆弱性影響，所以自本版起
+    當作 ARK 現況的**主來源**（見 choose_current）。App 沒開、token 過期、沒網路時
+    回 None，呼叫端自動回退為畫面(AX)主讀。
     """
     try:
         import arkapi
         return arkapi.positions(arkapi.session())
-    except Exception as e:                    # noqa: BLE001 - 輔助檢查，任何失敗都只是跳過
-        print(f"  （跳過伺服器對帳：{e}）", flush=True)
+    except Exception as e:                    # noqa: BLE001 - 讀不到就回退畫面，不是致命錯
+        print(f"  （API 讀取庫存不可用，改用畫面：{e}）", flush=True)
         return None
 
 
@@ -72,6 +74,34 @@ def cross_check(current, server):
         if a is None or b is None or a[0] != b[0] or abs(a[1] - b[1]) >= ark.PRICE_TOL:
             bad.append(f"{code}: 畫面 {a} vs 伺服器 {b}")
     return (False, "、".join(bad)) if bad else (True, None)
+
+
+def choose_current(api_positions, ax_positions):
+    """決定要用哪一份當 ARK 的權威現況，並在兩份都在時交叉驗證。
+
+    本版把主來源從畫面(AX)翻頁讀取改為 API（server_positions）：API 唯讀、無畫面、
+    不受 1.8.0／1.8.1 那類翻頁漏列或列格式改版的影響。畫面讀取降為**獨立見證**——
+    API 在時仍讀一次畫面比對，用的是 1.6.1 以來一路守著的「兩個獨立來源」安全網，
+    只是把權威那一方換成 API。
+
+    參數都是 {代號:(股數,均價)} 或 None：
+      api_positions  API 讀到的，或 None（App 沒開／token 過期／沒網路）
+      ax_positions   畫面讀到的，或 None（API 當家時畫面讀失敗就略過見證，不強讀）
+
+    回傳 (current, source, ok, mismatch)：
+      current   權威現況；ok 為 False 時給 None（呼叫端據此停手、不寫入）
+      source    印給使用者看的來源說明
+      ok        是否可繼續
+      mismatch  不可繼續時的原因（兩來源不符，或兩邊都讀不到）
+    """
+    if api_positions is not None and ax_positions is not None:
+        ok, mismatch = cross_check(ax_positions, api_positions)   # 比對對稱，誰當誰無妨
+        return (api_positions if ok else None), "API（畫面交叉驗證）", ok, mismatch
+    if api_positions is not None:
+        return api_positions, "API", True, None
+    if ax_positions is not None:
+        return ax_positions, "畫面(AX)", True, None
+    return None, "無", False, "API 與畫面都讀不到 ARK 現況"
 
 
 def plan_changes(current, target):
@@ -427,18 +457,33 @@ def main():
 
     pid = ax.ensure_ready()       # 不搶焦點：ARK 視窗可見即可，使用者可繼續用電腦
     pid = ark.ensure_responsive(ax, pid)   # 殭屍態（事件層死掉）在這裡自癒
-    print("讀取 ARK 庫存…")
-    holdings = ark.read_holdings(ax, pid)
-    declared = ark.read_declared_count(ax, pid)
-    check_parsed(holdings, declared)                 # 與 App 宣告的檔數交叉驗證
-    print(f"  ARK {len(holdings)} 檔" + (f"（App 宣告 {declared} 檔）" if declared else ""))
 
-    current = {code: (h.qty, h.price) for code, h in holdings.items()}
-    ok, mismatch = cross_check(current, server_positions())
+    # ARK 現況主來源 = API（唯讀、無畫面、不受翻頁／列解析脆弱性影響）。
+    # 畫面(AX)讀取降為獨立見證：API 在就讀一次畫面比對，讀失敗不擋；
+    # API 不可用時回退為原本的畫面主讀（含 App 宣告檔數交叉驗證）。
+    print("讀取 ARK 庫存…")
+    server = server_positions()
+    ax_positions = None
+    if server is not None:
+        try:
+            holdings = ark.read_holdings(ax, pid)
+            ax_positions = {code: (h.qty, h.price) for code, h in holdings.items()}
+        except Exception as e:                    # noqa: BLE001 - 見證讀不到不擋，API 已是權威
+            print(f"  （畫面見證略過：{e}）")
+    else:
+        holdings = ark.read_holdings(ax, pid)
+        declared = ark.read_declared_count(ax, pid)
+        check_parsed(holdings, declared)          # 回退路徑：與 App 宣告的檔數交叉驗證
+        ax_positions = {code: (h.qty, h.price) for code, h in holdings.items()}
+        if declared:
+            print(f"  App 宣告 {declared} 檔")
+
+    current, src, ok, mismatch = choose_current(server, ax_positions)
     if not ok:
-        print(f"🛑 畫面讀到的庫存與 ARK 伺服器不符，可能是解析器壞了：{mismatch}", file=sys.stderr)
+        print(f"🛑 讀取 ARK 現況失敗：{mismatch}", file=sys.stderr)
         print("   在弄清楚之前不做任何寫入。", file=sys.stderr)
         return 1
+    print(f"  ARK {len(current)} 檔（來源：{src}）")
     plan = plan_changes(current, target)
     if plan:
         print(f"\n需要 {len(plan)} 項變更：")

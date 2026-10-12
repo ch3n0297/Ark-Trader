@@ -191,5 +191,62 @@ class TestReadOnlyGuard(unittest.TestCase):
             arkapi.call(sess, "api/calculateRisk", fetch=fetch, now=NOW)
 
 
+class TestNewReadOnlyEndpoints(unittest.TestCase):
+    """1.9.3 新增的唯讀查詢。端點、body 與回應欄位都取自 App 自己呼叫過、留在 URL
+    快取裡的紀錄（非猜測），這裡用假 fetch 驗證：路徑進得了白名單、body／query 組對、
+    回應解析正確。寫入端點與 api/auth 刻意不收進唯讀層。"""
+
+    def _sess(self):
+        token = jwt(NOW + dt.timedelta(hours=1))
+        return arkapi.Session(token, "20260313220729978000", "dev", NOW + dt.timedelta(hours=1))
+
+    def _fetch(self, store):
+        def fetch(url, headers, body):
+            store["url"], store["body"] = url, body
+            return store["resp"]
+        return fetch
+
+    def test_目前點數取當前點數欄位(self):
+        s = {"resp": {"code": "0000",
+                      "title": ["會員序號", "當前點數", "AuthType", "是否為教練 1:是 0:否"],
+                      "data": [["x", "1,250", "1", "0"]]}}
+        self.assertEqual(arkapi.points(self._sess(), fetch=self._fetch(s), now=NOW), 1250.0)
+        self.assertIn("api/pointRecord/getCurrentPoint?", s["url"])
+        self.assertIn("memberId=", s["url"])
+
+    def test_匯率(self):
+        s = {"resp": {"code": "0000", "title": ["匯率"], "data": [["32.15"]]}}
+        self.assertEqual(arkapi.exchange_rate(self._sess(), fetch=self._fetch(s), now=NOW), 32.15)
+
+    def test_每日資產帶日期區間與member_id(self):
+        s = {"resp": {"code": "0000", "title": ["資料日期", "股票庫存總市值", "現金餘額"],
+                      "data": [["20261007", "100", "5"], ["20261008", "110", "5"]]}}
+        got = arkapi.asset_daily(self._sess(), "20261007", dt.date(2026, 10, 10),
+                                 fetch=self._fetch(s), now=NOW)
+        self.assertEqual(len(got), 2)
+        self.assertEqual(got[0]["資料日期"], "20261007")
+        self.assertEqual(s["body"]["start_date"], "20261007")
+        self.assertEqual(s["body"]["end_date"], "20261010")       # date → YYYYMMDD
+        self.assertEqual(s["body"]["member_id"], "20260313220729978000")
+
+    def test_策略清單(self):
+        s = {"resp": {"code": "0000", "title": ["策略ID", "策略名稱"],
+                      "data": [["10", "產業價值區"], ["6", "產業升溫區"]]}}
+        ids = arkapi.strategy_ids(self._sess(), fetch=self._fetch(s), now=NOW)
+        self.assertEqual(ids[0]["策略名稱"], "產業價值區")
+
+    def test_個股資料把symbols放進body(self):
+        s = {"resp": {"code": "0000",
+                      "title": ["股票代號", "K(9)", "淨值", "折溢價", "成交量", "成交金額"],
+                      "data": [["00631L", "85", "1.2", "0.1", "100", "200"]]}}
+        got = arkapi.stock_data(self._sess(), ["00631L", "0050"], fetch=self._fetch(s), now=NOW)
+        self.assertEqual(got[0]["股票代號"], "00631L")
+        self.assertEqual(s["body"]["symbols"], ["00631L", "0050"])
+
+    def test_auth端點不在白名單_唯讀層不自行換發token(self):
+        with self.assertRaises(ValueError):
+            arkapi.call(self._sess(), "api/auth", body={}, fetch=lambda *a, **k: {}, now=NOW)
+
+
 if __name__ == "__main__":
     unittest.main()
