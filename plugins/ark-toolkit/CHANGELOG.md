@@ -31,6 +31,10 @@
   美元現金避免歸零。預設完全不作用，`ark-sync` 實際寫入仍走 AX。評估、格式、擷取工具
   見 `references/write-api-conversion-assessment.md`（以 `ArkAPI_Catch/files/ark_capture.py`
   擷取、可 `diff` 回歸）。釐清「ARK 寫入≠下單」：真正買賣走 Shioaji，不轉 ARK 端點。
+- **ark-sync 可切 API 寫入**：設環境變數 `ARK_API_WRITES=1` 時，庫存（insert／update／delete）
+  與現金改走上述 `arkapi` 寫入函式（帶 read-after-write 驗證、不碰編輯頁），否則維持畫面(AX)。
+  切換邏輯收斂在 `sync.apply_write`／`sync.sync_cash`，安全閘（來源讀空拒絕、刪除過半拒絕、
+  dry-run）與重試一輪兩種後端都照舊。預設仍走 AX；dry-run 不論旗標都不寫入。
 
 ## [1.8.1] - 2026-10-12
 

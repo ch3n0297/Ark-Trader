@@ -60,6 +60,21 @@ uv run skills/ark-sync/sync.py --no-prompt      # 排程用：缺均價口徑時
 
 刪除預設略過，需明確加旗標。執行後再跑一次 `--dry-run` 確認結果。
 
+## 寫入後端：預設畫面(AX)，可切 API
+
+讀取（ARK 現有庫存）自 1.9.0 已以 ARK API 為主來源、畫面為交叉驗證。**寫入預設仍走畫面(AX)**，
+因為編輯彈窗有 App 自算的「總成本」當獨立見證。設環境變數 `ARK_API_WRITES=1` 可改走
+`arkapi` 的寫入函式（`set_cash`／`insert_holding`／`update_holding`／`delete_holding`），
+每筆帶 read-after-write 讀回驗證取代「總成本」見證：
+
+```bash
+ARK_API_WRITES=1 uv run skills/ark-sync/sync.py --with-cash   # 庫存與現金都走 API 寫入
+```
+
+API 寫入不碰編輯頁、較快且不受畫面捲動／解析脆弱性影響；失敗（含讀回不符）與 AX 同樣
+進重試一輪。安全閘（來源讀空拒絕、刪除過半拒絕、`--dry-run`）兩種後端都照舊生效。
+`dry-run` 不論旗標都不寫入。真正的買賣下單仍走券商（Shioaji），與此無關。
+
 ## 均價口徑：第一次問一次，之後沿用
 
 券商 API（`list_positions`）給的均價是**不含息、不含手續費**的純買進均價。

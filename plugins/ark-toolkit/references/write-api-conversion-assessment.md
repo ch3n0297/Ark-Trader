@@ -105,13 +105,15 @@ ARK API 的可行性、證據、未知數與落地設計。對應 1.9.0 已完�
 
 1. ✅ 抓真實寫入（2026-10-12）：五個寫入全部實測，格式見第 3 節，確認**無 checksum**。
 2. ✅ `arkapi` 寫入層已實作並通過測試（見第 6 節），預設關閉。
-3. ⏳ **選用**：把 `ark-sync` 的寫入從 AX 改走這些函式（旗標後），沿用現有安全閘（來源讀空
-   拒絕、刪除過半拒絕、dry-run），AX 保留當回退與第二見證。尚未動——改現有交易工具的
-   寫入路徑風險較高，待明確需求再做。
+3. ✅ `ark-sync` 的寫入已可切到這些函式：設 `ARK_API_WRITES=1` 時庫存（insert／update／
+   delete）與現金改走 `arkapi`，否則維持 AX。切換邏輯在 `sync.apply_write` 與 `sync.sync_cash`，
+   沿用現有安全閘（來源讀空拒絕、刪除過半拒絕、dry-run），AX 保留當預設與回退，附測試
+   `test_sync.py::TestWriteBackend`。
 4. 券商下單維持 Shioaji 不動，永不轉 ARK 端點。
 
 ## 8. 目前狀態
 
-寫入轉 API 技術上已完成且可用：格式實測、無 checksum、函式與測試就緒，但**預設關閉**
-（需 `ARK_API_WRITES=1`＋`confirm=True`）。`ark-sync` 的實際寫入仍走 AX；要切成 API 寫入
-是第 7.3 的獨立決定。日後 App 改版要重驗端點：用 `files/ark_capture.py`（`up`→操作→`diff`）。
+寫入轉 API 已完成：格式實測、無 checksum、`arkapi` 函式與 `ark-sync` 的後端切換都就緒並
+通過測試。**預設仍走 AX**（有「總成本」見證）；設 `ARK_API_WRITES=1` 才改走 API 寫入
+（每筆帶 read-after-write 讀回驗證）。dry-run 不論旗標都不寫入；券商下單與此無關。
+日後 App 改版要重驗端點：用 `files/ark_capture.py`（`up`→操作→`diff`）。
