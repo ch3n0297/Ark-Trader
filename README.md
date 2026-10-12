@@ -1,16 +1,29 @@
-# ark-tools
+# Ark-Trader
 
-方舟運算(ARK) App 的持倉同步與分析工具，可同時安裝到 **Claude Code** 與 **Codex**。
+方舟運算(ARK) App 的持倉同步、分析與自動交易工具，可同時安裝到 **Claude Code** 與 **Codex**。
+
+## 架構：API 優先、AX 兜底
+
+自 2.0.0 起，所有讀寫操作**預設走 ARK 後端 API**（`ark-api.my-galaxy.com.tw`），
+不再依賴畫面抓取。Accessibility(AX) 操作降為**最終手段**——僅在 API 不可用
+（App 未開、token 過期、無網路）時自動回退。
+
+| 層級 | 讀取 | 寫入 |
+|---|---|---|
+| **主要：API** | `arkapi.positions()`、`cash()` 等 11 個端點 | `set_cash`、`insert/update/delete_holding`（需 `ARK_API_WRITES=1`） |
+| **回退：AX** | 翻頁畫面抓取（API 不可用時自動啟用） | AX 畫面操作（預設，或 API 寫入失敗時回退） |
+
+API 與 AX 同時可用時，兩邊交叉比對；不一致則停手不寫入。
+
+## 帳戶來源
 
 「真實持倉」由帳戶清單組成，兩類帳戶可任意搭配、多帳戶自動合併：
 
-- **券商 API 帳戶** —— 直接串接券商查詢即時持倉。目前支援永豐 Shioaji，
+- **券商 API 帳戶** — 直接串接券商查詢即時持倉。目前支援永豐 Shioaji，
   架構上可擴充其他券商
-- **檔案帳戶** —— 任何券商匯出的 CSV／Excel 持股清單，無 API 也能對帳
+- **檔案帳戶** — 任何券商匯出的 CSV/Excel 持股清單，無 API 也能對帳
 
-兩邊共用同一份 `skills/`，只是各自需要一份 metadata（`.claude-plugin/` 與 `.codex-plugin/`）。
-
-## 內容
+## Skills
 
 | Skill | 用途 |
 |---|---|
@@ -18,7 +31,7 @@
 | `ark-start` | 初次上手驗證軌：模擬環境送單驗證委託路徑（不碰真錢），通過後自動串接實際看單 |
 | `ark-read` | 靜默讀取各帳戶即時持倉與合併結果（不碰 ARK、不彈視窗、只讀不寫） |
 | `ark-collect` | 兩階段同步的階段一：收集各帳戶持倉，確認後寫入當日快照 |
-| `ark-sync` | 兩階段同步的階段二：以真實持倉同步 ARK 庫存；只有 API 帳戶時可直接執行 |
+| `ark-sync` | 兩階段同步的階段二：以真實持倉同步 ARK 庫存（API 讀寫為主，AX 為回退） |
 | `ark-analyze` | 集中度、與 App 建議部位的偏離、風控檢查、歷史快照復盤 |
 | `ark-explore` | 探索全 App 結構，產出功能地圖（以版本號當快取鍵，版本沒變就跳過） |
 | `ark-agent` | 自動交易決策軌：盤中決策包、依 ARK 紀律決策並鎖定、自動下單、成交對回、滾動評估 |
@@ -26,56 +39,75 @@
 
 | 參考資料 | 用途 |
 |---|---|
-| `references/ark-app-map.md` | **全 App 功能地圖** —— 每一頁在幹嘛、讀得到什麼、什麼時候該用它 |
-| `references/ark-app-ux.svg` | UX 流程圖 —— 核心資料流與六個 tab 的視覺化 |
-
-要回答「這個 App 怎麼用」「策略頁在幹嘛」，直接讀 `references/ark-app-map.md`，
-不必跑 `ark-explore`。只有 App 改版後才需要重跑。
+| `references/ark-app-map.md` | **全 App 功能地圖** — 每一頁在幹嘛、讀得到什麼、什麼時候該用它 |
+| `references/ark-app-ux.svg` | UX 流程圖 — 核心資料流與六個 tab 的視覺化 |
+| `references/write-api-conversion-assessment.md` | 寫入轉 API 評估 — 端點格式、mitm 實測、read-after-write 設計 |
 
 ## 安裝
 
 ### Claude Code
 
 ```bash
-/plugin marketplace add ch3n0297/ark-tools
-/plugin install ark-toolkit@ark-tools
+/plugin marketplace add ch3n0297/Ark-Trader
+/plugin install ark-toolkit@Ark-Trader
 ```
 
 ### Codex
 
 ```bash
-codex plugin marketplace add ch3n0297/ark-tools
+codex plugin marketplace add ch3n0297/Ark-Trader
 codex plugin add ark-toolkit
 ```
 
-本機開發改用 checkout 路徑：把上面的 `ch3n0297/ark-tools` 換成本機路徑（如 `<repo>/plugin`）。
+本機開發改用 checkout 路徑：把上面的 `ch3n0297/Ark-Trader` 換成本機路徑。
 
 ### 更新
 
 ```bash
-/plugin marketplace update ark-tools          # Claude Code（第三方 marketplace 自動更新預設關閉）
-codex plugin marketplace upgrade ark-tools    # Codex（無單一 plugin 的 update 指令，重拉整個 marketplace）
+/plugin marketplace update Ark-Trader          # Claude Code
+codex plugin marketplace upgrade Ark-Trader    # Codex
 ```
 
 ## 前置需求
 
-- **macOS**（依賴 Accessibility API 與 Apple Silicon 的 iOS App 相容層）
-- 方舟運算已安裝並登入（未開啟會自動代為啟動；未安裝會明確提示先從 App Store 安裝）
-- 終端機／IDE 已取得「輔助使用」權限（系統設定 → 隱私權與安全性 → 輔助使用）
+- **macOS**（Apple Silicon；依賴 iOS App 相容層）
+- 方舟運算已安裝並登入（未開啟會自動代為啟動）
+- 終端機/IDE 已取得「輔助使用」權限（系統設定 > 隱私權與安全性 > 輔助使用）
 - [uv](https://docs.astral.sh/uv/) — 各腳本以 PEP 723 宣告依賴，`uv run` 會自動準備
-  Python 與套件（機器不需要預先安裝 Python；uv 未裝時各 skill 會自動安裝）
+  Python 與套件（uv 未裝時各 skill 會自動安裝）
 
 ## 快速開始
 
-初次使用兩步：`ark-setup` 設定帳戶 → `ark-start` 驗證（模擬單通過後自動接實際看單）。
+初次使用兩步：`ark-setup` 設定帳戶 > `ark-start` 驗證（模擬單通過後自動接實際看單）。
 
 ```bash
-uv run plugins/ark-toolkit/skills/ark-setup/setup.py             # 帳戶清單設定（原生視窗精靈）
-uv run plugins/ark-toolkit/skills/ark-start/verify.py            # 模擬單驗證委託路徑（不碰真錢）
+uv run plugins/ark-toolkit/skills/ark-setup/setup.py             # 帳戶清單設定
+uv run plugins/ark-toolkit/skills/ark-start/verify.py            # 模擬單驗證（不碰真錢）
 uv run plugins/ark-toolkit/skills/ark-read/read.py               # 靜默看各帳戶持倉
 uv run plugins/ark-toolkit/skills/ark-sync/sync.py --dry-run     # 看 ARK 與真實持倉的差異
 uv run plugins/ark-toolkit/skills/ark-analyze/analyze.py         # 看風險
-uv run plugins/ark-toolkit/skills/ark-explore/run.py --show      # 看功能地圖快取
+```
+
+### 寫入後端切換
+
+ark-sync 寫入預設走 AX（有 App「總成本」見證）。切換到 API 寫入：
+
+```bash
+ARK_API_WRITES=1 uv run plugins/ark-toolkit/skills/ark-sync/sync.py --dry-run   # 先 dry-run 確認
+ARK_API_WRITES=1 uv run plugins/ark-toolkit/skills/ark-sync/sync.py             # 實際執行
+```
+
+API 寫入每筆帶 read-after-write 驗證（寫入後讀回比對最終狀態），取代 AX 的「總成本」見證。
+
+### API 端點回歸（App 更新後）
+
+App 改版時用 `ark_capture.py`（需 mitmproxy）驗證端點是否變更：
+
+```bash
+python3 ark_capture.py up        # 啟動 mitm 攔截
+# 在 App 上操作一輪讀寫
+python3 ark_capture.py diff      # 比對基準，顯示新增/移除/變更的端點
+python3 ark_capture.py down      # 關閉攔截、移除 CA
 ```
 
 ## 測試
@@ -97,16 +129,20 @@ cd plugins/ark-toolkit/skills/ark-agent   && PYTHONPATH=../../lib uv run --no-pr
 
 ## 通用性原則（給使用本 plugin 的 coding agent）
 
-本 plugin 會發佈給其他使用者，內容必須保持通用。給每個使用它的 coding agent 的建議：
+本 plugin 會發佈給其他使用者，內容必須保持通用：
 
-- **個人化內容不進 plugin** —— 帳戶設定、排程參數（如已安裝 plist 的環境變數）、
-  專案／實驗協定、一次性調整、私人筆記，一律放執行資料夾 `~/.ark-toolkit/`
-  或專案自己的 `docs/`，不要直接修改 plugin 原始碼。
+- **個人化內容不進 plugin** — 帳戶設定、排程參數、專案/實驗協定、一次性調整，
+  一律放 `~/.ark-toolkit/` 或專案 `docs/`，不要直接修改 plugin。
 - **只有通用的修復與功能才改 plugin 本身**，並附測試；註解寫通用理由，不寫個人脈絡。
 - 判斷標準：**換一個使用者、換一個帳戶，這段內容還成立嗎？** 不成立就不屬於這裡。
 
 ## 設計要點
 
-ARK 是 FairPlay 加密的 wrapped iOS App，沒有官方 API，全靠 Accessibility API 操作 UI。實作中有數個「失敗會偽裝成成功」的陷阱（`AXSetValue` 假成功、被遮擋元素的 `AXPress` 回傳 0 卻無效、解析失效被當成空庫存），各 skill 的 `SKILL.md` 有完整說明——修改程式碼前請先讀。
-
-所有寫入前都以 App 自算的「總成本」交叉驗算，不符即中止不儲存。分析只陳述事實與偏離量，不產出買賣建議。
+- **API 優先**：讀寫操作預設走 ARK 後端 API，不受 App UI 改版影響。API 不可用時
+  自動回退 AX（Accessibility API 操作 UI），維持可用性。
+- **交叉驗證**：API 與 AX 同時可用時交叉比對，不一致即停手不寫入。
+- **寫入安全**：API 寫入帶 read-after-write 驗證；AX 寫入以 App「總成本」交叉驗算。
+  雙重開關（`confirm=True` + `ARK_API_WRITES=1`）防止誤觸。
+- **券商下單獨立**：真正的買賣走 Shioaji 券商 API，永不經 ARK 端點。ARK 寫入只更新
+  建議 App 的顯示資料，不是交易。
+- 分析只陳述事實與偏離量，不產出買賣建議。
