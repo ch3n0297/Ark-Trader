@@ -551,7 +551,8 @@ def main():
         return 0 if sync_cash(ax, pid, cfg, api_sess) else 1
 
     if args.dry_run:
-        print("\n（dry-run，未做任何寫入）")
+        backend = "API（ARK_API_WRITES=1）" if writes_use_api() else "畫面(AX)"
+        print(f"\n（dry-run，未做任何寫入；實際執行時寫入後端將為 {backend}）")
         return 0
 
     skipped = [c for a, c, *_ in plan if a == "delete" and not args.allow_delete]
