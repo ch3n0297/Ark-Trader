@@ -33,18 +33,22 @@ ARK API 的可行性、證據、未知數與落地設計。對應 1.9.0 已完�
 這些與 `test_arkapi` 唯讀守衛測試裡被拒絕的範例（`api/myStock/update/...`、
 `api/calculateRisk/memberMoney/update`）一致——它們是真實存在的寫入端點。
 
-## 3. 證據與未知數
+## 3. 證據（2026-10-12 mitm 實測）
 
-| 項目 | 狀態 |
+用 mitmproxy 攔到一筆真實的改庫存（00935 股數 32→33→32，淨零），確認了格式：
+
+| 項目 | 結果 |
 |---|---|
-| 端點路徑 | **已觀察**（二進位字串） |
-| HTTP method | 推斷為 POST（同讀取端點慣例，待實測） |
-| 請求 body 形狀 | **未知**。URL 快取只留查詢／可快取回應，寫入 POST 的 body 沒被快取 |
-| `checksum` / `checksumEnabled` | **未知是否卡寫入**。二進位有這些字串且連結 CryptoSwift，寫入可能需要正確 checksum／簽章，演算法未還原 |
-| token scope | 未知。讀取用的 App token 是否足以寫入，待實測 |
+| 改股數／均價 | `POST api/myStock/update/{member_id}/{code}/{kind}/{qty}/{avgPrice}` — **參數全在 URL path**；query 只帶 `?deviceType=I&deviceToken=…`；**body 為空 `{}`** |
+| 連帶更新均價 | `POST api/myStock/avgPrice/upsert`，body `{member_id, deviceType, deviceToken, stock_code, data_date:"YYYYMMDD", avg_price}` |
+| `checksum` / 簽章 | **不需要**。寫入 header 無任何 checksum／sign；`checksumEnabled` 不卡這些寫入。（二進位的 MD5 字串來自 Firebase 效能監控，非請求簽章） |
+| 認證 | 與讀取相同：`Authorization: Bearer <app token>` ＋ `deviceType=I&deviceToken=…`。讀取用的 App token 足以寫入 |
+| 回應 | `{"code":"0000","message":"操作成功"}`（只回成功，不回寫入後狀態） |
+| User-Agent | `Arkeration/1.9.3 (com.galaxy.ark; build:1.9.3.0; iOS 26.6.0) Alamofire/5.9.0`（建議比照，未確認是否必需） |
 
-**結論**：端點知道了，但「怎麼合法送出一筆寫入」尚未驗證。盲目照讀取慣例送，很可能
-被 checksum 或 body 格式擋下（回 4xx），甚至靜默不生效。
+**結論**：改庫存的完整送法已驗證，且**沒有 checksum 障礙**——這是先前最大的未知數，現已清除。
+`insert`／`delete`／`memberMoney/update`（現金）尚未各攔一筆，格式可由此類推，但落地前建議
+比照各實測一次（見第 7 節）。
 
 ## 4. 如何取代「總成本」這個獨立見證
 
@@ -73,50 +77,59 @@ ARK API 的可行性、證據、未知數與落地設計。對應 1.9.0 已完�
 
 ## 6. 設計提案（尚未接線）
 
-保持 `call()` 唯讀不變，另立寫入通道，預設關閉、需顯式開啟：
+保持 `call()` 唯讀不變，另立寫入通道，預設關閉、需顯式開啟。因實測確認**不需 checksum**，
+通道比原先設想簡單——送出 ＋ read-after-write 讀回驗證即可：
 
 ```python
 # arkapi.py —— 提案，未接線
 WRITE_ENDPOINTS = {
-    "api/myStock/insert", "api/myStock/update/{member_id}", "api/myStock/delete/{id}",
-    "api/calculateRisk/memberMoney/update",
+    "api/myStock/update/{member_id}/{code}/{kind}/{qty}/{avgPrice}",  # 改股數/均價（path 參數、body {}）
+    "api/myStock/avgPrice/upsert",                                    # 連帶更新均價（body 帶欄位）
+    "api/myStock/insert", "api/myStock/delete/{member_id}/{code}",    # 新增/刪除（格式待各攔一次確認）
+    "api/calculateRisk/memberMoney/update",                           # 現金（待實測）
 }
 
-def write(sess, path, body, *, verify, confirm=False, fetch=_fetch, now=None):
-    """送出一次寫入。預設拒絕：必須 confirm=True 且 ARK_API_WRITES=1。
-    verify(sess) 是寫入後讀回驗證的 callable，回 True 才算成功。"""
+def write(sess, path, *, body=None, query=None, verify, confirm=False, fetch=_fetch, now=None):
+    """送出一次寫入。預設拒絕：必須 confirm=True 且環境變數 ARK_API_WRITES=1。
+    verify(sess) 是寫入後讀回驗證的 callable，回 True 才算成功。無 checksum。"""
     if not (confirm and os.environ.get("ARK_API_WRITES") == "1"):
         raise PermissionError("寫入預設關閉：需 confirm=True 且 ARK_API_WRITES=1")
-    template = _templatize(path)
-    if template not in WRITE_ENDPOINTS:
+    if _templatize(path) not in WRITE_ENDPOINTS:
         raise ValueError(f"不在寫入白名單：{path}")
-    if CHECKSUM_REQUIRED:
-        body = {**body, "checksum": _checksum(body)}   # 演算法待還原
-    resp = call_write(sess, path, body, fetch=fetch, now=now)   # POST
+    if not token_valid(sess.token, now=now):
+        raise ArkApiError("登入憑證已過期")
+    params = {"deviceType": "I", "deviceToken": sess.device_token, **(query or {})}
+    url = BASE + path + "?" + urllib.parse.urlencode(params)
+    headers = {"Authorization": f"Bearer {sess.token}", "Accept": "*/*",
+               "Content-Type": "application/json"}
+    resp = fetch(url, headers, body if body is not None else {})   # 空 body 也送 {}
     if resp.get("code") != "0000":
-        raise ArkApiError(f"寫入未成功 code={resp.get('code')}")
+        raise ArkApiError(f"寫入未成功 code={resp.get('code')}：{resp.get('message')}")
     if not verify(sess):                 # read-after-write：讀回不符即失敗
         raise ArkApiError("寫入後讀回與目標不符，視為未生效")
     return resp
 ```
 
-要點：寫入白名單與讀取白名單分離；顯式 opt-in（旗標＋`confirm`）；checksum 內建但待
-填演算法；**read-after-write 當獨立見證**；`sync` 仍可保留 AX 寫入當回退與對照。
+要點：寫入白名單與讀取白名單分離；顯式 opt-in（旗標＋`confirm`）；**無 checksum**；
+**read-after-write 當獨立見證**；`sync` 仍可保留 AX 寫入當回退與對照。
+
+改一檔庫存 = 兩支呼叫（實測）：`myStock/update/{...}/{qty}/{avgPrice}`（path 參數、body `{}`）
+＋ `myStock/avgPrice/upsert`（body 帶 `member_id, stock_code, data_date, avg_price`）。
+verify 用 `arkapi.positions()` 讀回該檔比對股數／均價。
 
 ## 7. 落地前必須先做的事（順序）
 
-1. **抓一筆真實寫入**：用 ArkAPI_Catch 的 mitm 代理，在 App 裡實際改一檔庫存與改一次
-   現金，攔下 `myStock/update` 與 `memberMoney/update` 的完整 body 與 header，確認
-   是否帶 checksum 與其組成。這是唯一能把「未知」變「已知」的步驟。
-2. **還原 checksum**（若步驟 1 顯示需要）：從 CryptoSwift 用法與 body 對照推出演算法，
-   或在授權範圍內以實測樣本反推。
+1. ~~**抓一筆真實寫入**~~ ✅ **已完成（2026-10-12）**：mitm 攔到 `myStock/update` ＋
+   `myStock/avgPrice/upsert`，格式見第 3 節，確認**無 checksum**。
+2. **補攔 `insert`／`delete`／`memberMoney/update` 各一筆**（同法，各做一次真實小改動再還原），
+   確認剩下三個寫入的 path／body。
 3. **先做現金**（單欄位、最好驗證）：`write()` + `arkapi.cash()` 讀回驗證，旗標後。
-4. **再做庫存** insert/update/delete，沿用 read-after-write 與現有安全閘（來源讀空拒絕、
+4. **再做庫存** update/insert/delete，沿用 read-after-write 與現有安全閘（來源讀空拒絕、
    刪除過半拒絕、dry-run）。
 5. **保留 AX 寫入**當回退與第二見證；券商下單維持 Shioaji 不動。
 
 ## 8. 目前建議
 
-在步驟 1（實測 body＋checksum）完成前，**維持 AX 寫入**：端點已知但送出格式未驗證，
-盲轉會被擋下或靜默失敗，而「總成本」見證是已證可靠的。本評估已備妥設計與驗證方式，
-一旦攔到真實寫入樣本即可按第 6、7 節落地。
+最大障礙（checksum）已排除，改庫存送法也實測確認，**技術上可落地**。建議：補攔其餘三個
+寫入端點（第 7.2）後，依第 6 節在旗標後先接現金、再接庫存，一律帶 read-after-write 驗證，
+並保留 AX 寫入當回退。在接線完成並通過測試前，預設仍走 AX。

@@ -24,9 +24,10 @@
   App 自算「總成本」當獨立見證；相應的寫入 API 端點未經驗證，且寫入／下單不可逆，
   不從唯讀層走——`api/auth`（換發 token，body 帶 appId／appSecret）亦刻意排除於白名單外。
 - **寫入轉 API 評估**：`references/write-api-conversion-assessment.md` 盤點 AX 寫入對應的
-  ARK 端點（`myStock/insert`／`update`／`delete`、`memberMoney/update` 等，取自主程式字串）、
-  釐清「ARK 寫入≠下單」（真正下單走 Shioaji）、提出以 read-after-write 取代「總成本」
-  見證的設計，並列出落地前必須先用 mitm 攔一筆真實寫入以確認 body 與 checksum。
+  ARK 端點（`myStock/update`／`avgPrice/upsert`／`insert`／`delete`、`memberMoney/update` 等）、
+  釐清「ARK 寫入≠下單」（真正下單走 Shioaji）、提出以 read-after-write 取代「總成本」見證。
+  已用 mitm 實測攔到改庫存寫入：參數在 URL path、body 空、認證同讀取，且**不需 checksum**
+  （先前最大的未知數已排除）；技術上可落地，詳見該文件。
 
 ## [1.8.1] - 2026-10-12
 
