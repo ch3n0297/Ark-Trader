@@ -2,6 +2,7 @@
 import json
 import os
 import tempfile
+import time
 import unittest
 
 import ark
@@ -1490,6 +1491,74 @@ class TestWriteBackend(unittest.TestCase):
         finally:
             sync.update_holding, sync.add_holding, sync.delete_holding = orig
         self.assertEqual(calls, [("add", "2313"), ("update", "0050"), ("delete", "0056")])
+
+
+class TestReadArkSide(unittest.TestCase):
+    """API 當權威且寫入走 API 時，畫面只剩見證：畫面報錯或卡住都不該拖垮同步。
+    實例：2026-10-12 結算碰上 App 更新（ensure_responsive 失敗）、2026-10-13 早上兩次
+    dry-run 各卡在 ensure_ready／ensure_responsive 五分鐘。"""
+
+    SERVER = {"0050": (17, 96.76)}
+
+    class FakeAxModule:
+        def __init__(self, ready):
+            self._ready = ready
+
+        def ensure_ready(self):
+            return self._ready()
+
+    def _patch(self, responsive=lambda ax, pid: pid, holdings=None):
+        from unittest import mock
+        h = holdings if holdings is not None else {
+            "0050": ark.Holding("0050", 17, 96.76, 1645.0, 1756.0, 111.0, 6.71, -9.0, (),
+                                None, None)}
+        patches = [mock.patch.object(sync.ark, "ensure_responsive", side_effect=responsive),
+                   mock.patch.object(sync.ark, "read_holdings", return_value=h)]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _boom(self):
+        raise RuntimeError("ARK UI 無回應，重啟後仍無效")
+
+    def test_API寫入時畫面報錯略過見證不中斷(self):
+        self._patch()
+        pid, ax_pos = sync.read_ark_side(self.FakeAxModule(self._boom), self.SERVER,
+                                         api_writes=True)
+        self.assertIsNone(pid)
+        self.assertIsNone(ax_pos)
+
+    def test_API寫入時畫面卡住在時限內放棄(self):
+        self._patch()
+        t = time.time()
+        pid, ax_pos = sync.read_ark_side(self.FakeAxModule(lambda: time.sleep(5) or 1),
+                                         self.SERVER, api_writes=True, budget=1)
+        self.assertLess(time.time() - t, 3)
+        self.assertIsNone(ax_pos)
+
+    def test_API寫入時畫面正常照常見證(self):
+        self._patch()
+        _pid, ax_pos = sync.read_ark_side(self.FakeAxModule(lambda: 42), self.SERVER,
+                                          api_writes=True)
+        self.assertEqual(ax_pos, {"0050": (17, 96.76)})
+
+    def test_畫面寫入時畫面失敗仍中止(self):
+        self._patch()
+        with self.assertRaises(RuntimeError):
+            sync.read_ark_side(self.FakeAxModule(self._boom), self.SERVER, api_writes=False)
+
+    def test_API讀不到時畫面失敗仍中止(self):
+        self._patch()
+        with self.assertRaises(RuntimeError):
+            sync.read_ark_side(self.FakeAxModule(self._boom), None, api_writes=True)
+
+    def test_限時結束後還原SIGALRM處理器(self):
+        import signal
+        self._patch()
+        before = signal.getsignal(signal.SIGALRM)
+        sync.read_ark_side(self.FakeAxModule(lambda: 42), self.SERVER, api_writes=True)
+        self.assertIs(signal.getsignal(signal.SIGALRM), before)
+        self.assertEqual(signal.alarm(0), 0)
 
 
 if __name__ == "__main__":
