@@ -5,6 +5,12 @@
 
 ## [Unreleased]
 
+- **ark-sync：API 寫入時畫面不再是必經關卡**。`ARK_API_WRITES=1` 且 API 讀得到時，
+  喚醒／殭屍探測／翻頁讀整段改為見證、限時 120 秒（`sync.read_ark_side`），報錯或
+  超時就略過見證、只靠 API 繼續；畫面是寫入後端或唯一來源時照舊失敗即中止。
+  實例：2026-10-12 結算碰上 App 更新（`ensure_responsive` 失敗、整場同步放棄）、
+  2026-10-13 兩次 dry-run 各卡在 `ensure_ready`／`ensure_responsive` 五分鐘。
+
 - 測試：`test_daily` 以模組層 `setUpModule` 把 `daily.STATE`／`LOG` 指到暫存目錄，
   `guard_gates` 等會寫日誌的路徑不再落到使用者的 `~/.ark-toolkit/agent/daily.log`
   （自 2026-09-09 起正式日誌已混進 42 行 `[test]` 還原訊息）；`TestLogIsolation` 守住。

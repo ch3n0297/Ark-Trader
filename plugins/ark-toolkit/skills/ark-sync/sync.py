@@ -19,6 +19,7 @@ import argparse
 import datetime as dt
 import os
 import re
+import signal
 import sys
 import time
 
@@ -56,6 +57,55 @@ def server_positions():
     except Exception as e:                    # noqa: BLE001 - 讀不到就回退畫面，不是致命錯
         print(f"  （API 讀取庫存不可用，改用畫面：{e}）", flush=True)
         return None
+
+
+WITNESS_BUDGET = 120
+
+
+def _within(budget, fn):
+    """限時跑 fn；超時拋 TimeoutError。AX 呼叫卡在 C 層時，訊號要等該次呼叫返回才生效。"""
+    def _expire(_signum, _frame):
+        raise TimeoutError(f"畫面操作超過 {budget} 秒")
+    previous = signal.signal(signal.SIGALRM, _expire)
+    signal.alarm(budget)
+    try:
+        return fn()
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def read_ark_side(ax, server, api_writes, budget=WITNESS_BUDGET):
+    """畫面(AX)那一側：回傳 (pid, 畫面持倉 {代號:(股數,均價)} 或 None)。
+
+    API 讀得到且寫入走 API 時，畫面只剩見證——喚醒、殭屍探測、翻頁讀整段限時，
+    報錯或超時就略過見證（pid 為 None，後續寫入不碰畫面）。其餘情況畫面是寫入
+    後端或唯一來源，失敗照舊往外拋。
+    """
+    def positions(pid):
+        return {code: (h.qty, h.price) for code, h in ark.read_holdings(ax, pid).items()}
+
+    if server is not None and api_writes:
+        try:
+            return None, _within(budget, lambda: positions(
+                ark.ensure_responsive(ax, ax.ensure_ready())))
+        except Exception as e:                    # noqa: BLE001 - 見證缺席不擋，API 已是權威
+            print(f"  （畫面見證略過：{e}）", flush=True)
+            return None, None
+
+    pid = ark.ensure_responsive(ax, ax.ensure_ready())   # 殭屍態（事件層死掉）在這裡自癒
+    if server is not None:
+        try:
+            return pid, positions(pid)
+        except Exception as e:                    # noqa: BLE001 - 見證讀不到不擋，API 已是權威
+            print(f"  （畫面見證略過：{e}）")
+            return pid, None
+    holdings = ark.read_holdings(ax, pid)
+    declared = ark.read_declared_count(ax, pid)
+    check_parsed(holdings, declared)              # 回退路徑：與 App 宣告的檔數交叉驗證
+    if declared:
+        print(f"  App 宣告 {declared} 檔")
+    return pid, {code: (h.qty, h.price) for code, h in holdings.items()}
 
 
 def cross_check(current, server):
@@ -486,28 +536,11 @@ def main():
 
     import ax
 
-    pid = ax.ensure_ready()       # 不搶焦點：ARK 視窗可見即可，使用者可繼續用電腦
-    pid = ark.ensure_responsive(ax, pid)   # 殭屍態（事件層死掉）在這裡自癒
-
     # ARK 現況主來源 = API（唯讀、無畫面、不受翻頁／列解析脆弱性影響）。
-    # 畫面(AX)讀取降為獨立見證：API 在就讀一次畫面比對，讀失敗不擋；
-    # API 不可用時回退為原本的畫面主讀（含 App 宣告檔數交叉驗證）。
+    # 畫面(AX)讀取降為獨立見證；API 不可用時回退為畫面主讀（含 App 宣告檔數交叉驗證）。
     print("讀取 ARK 庫存…")
     server = server_positions()
-    ax_positions = None
-    if server is not None:
-        try:
-            holdings = ark.read_holdings(ax, pid)
-            ax_positions = {code: (h.qty, h.price) for code, h in holdings.items()}
-        except Exception as e:                    # noqa: BLE001 - 見證讀不到不擋，API 已是權威
-            print(f"  （畫面見證略過：{e}）")
-    else:
-        holdings = ark.read_holdings(ax, pid)
-        declared = ark.read_declared_count(ax, pid)
-        check_parsed(holdings, declared)          # 回退路徑：與 App 宣告的檔數交叉驗證
-        ax_positions = {code: (h.qty, h.price) for code, h in holdings.items()}
-        if declared:
-            print(f"  App 宣告 {declared} 檔")
+    pid, ax_positions = read_ark_side(ax, server, writes_use_api())
 
     current, src, ok, mismatch = choose_current(server, ax_positions)
     if not ok:
