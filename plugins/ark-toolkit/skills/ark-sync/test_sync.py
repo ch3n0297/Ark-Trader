@@ -1561,5 +1561,43 @@ class TestReadArkSide(unittest.TestCase):
         self.assertEqual(signal.alarm(0), 0)
 
 
+class TestRefreshScreenAfterApiWrites(unittest.TestCase):
+    """API 寫入直達伺服器，App 畫面要冷啟動才重抓庫存。
+
+    實例（2026-10-14）——10/13 14:30 結算以 API 新增 2317，14:25 的排程重啟在寫入之前，
+    隔天 10:00 決策包的畫面見證仍是 17 檔，與伺服器 18 檔不符，整天不交易。
+    """
+
+    def test_API寫入庫存後要刷新畫面(self):
+        self.assertTrue(sync.screen_stale_after(api_writes=True, applied=[["add", "2317"]]))
+
+    def test_API沒寫成任何一筆就不必(self):
+        self.assertFalse(sync.screen_stale_after(api_writes=True, applied=[]))
+
+    def test_畫面寫入本來就在畫面上(self):
+        self.assertFalse(sync.screen_stale_after(api_writes=False, applied=[["add", "2317"]]))
+
+    def test_刷新就是重啟App(self):
+        calls = []
+
+        class FakeAx:
+            @staticmethod
+            def restart_app():
+                calls.append("restart")
+                return 42
+
+        self.assertTrue(sync.refresh_screen(FakeAx))
+        self.assertEqual(calls, ["restart"])
+
+    def test_重啟失敗不推翻已驗證的寫入(self):
+        """寫入已讀回驗證；重啟失敗只是畫面還舊，下一場的交叉驗證會擋，不該讓同步報失敗"""
+        class FakeAx:
+            @staticmethod
+            def restart_app():
+                raise RuntimeError("ARK 未回應")
+
+        self.assertFalse(sync.refresh_screen(FakeAx))
+
+
 if __name__ == "__main__":
     unittest.main()
