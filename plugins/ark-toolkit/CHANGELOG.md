@@ -5,6 +5,8 @@
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-10-14
+
 - **ark-sync：API 寫成庫存後重啟 App，讓畫面跟上伺服器**（`sync.screen_stale_after`／
   `refresh_screen`）。API 直達伺服器，App 要冷啟動才重抓庫存列表；畫面落後時下一場的
   畫面見證必與伺服器不符而整場停手。重啟失敗只警告、不推翻已讀回驗證的寫入。
