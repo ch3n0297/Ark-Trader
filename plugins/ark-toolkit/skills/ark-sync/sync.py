@@ -494,6 +494,28 @@ def apply_write(action, code, qty, price, ax, pid, api_sess):
     return delete_holding(ax, pid, code)
 
 
+def screen_stale_after(api_writes, applied):
+    """API 寫成庫存後，App 畫面是否落後於伺服器。
+
+    API 直達伺服器，App 不會自己重抓庫存列表，要冷啟動才跟上；畫面落後時，
+    下一場的畫面見證（`cross_check`）必與伺服器不符而整場停手（2026-10-14 實例）。"""
+    return bool(api_writes) and bool(applied)
+
+
+def refresh_screen(ax):
+    """重啟 App 讓畫面跟上伺服器。回傳是否成功；失敗不拋——寫入已讀回驗證，
+    畫面還舊的後果是下一場交叉驗證擋下（安全側），不該推翻這次同步。"""
+    print("\n重啟方舟運算，讓畫面跟上 API 寫入…", flush=True)
+    try:
+        ax.restart_app()
+    except Exception as e:                     # noqa: BLE001 - 見 docstring
+        print(f"  ⚠️ 重啟失敗：{e}——畫面仍是寫入前的庫存，下一場畫面見證會不符；"
+              "手動重啟 App 即可")
+        return False
+    print("  ✅ 已重啟")
+    return True
+
+
 def main():
     ap = argparse.ArgumentParser(description="把 ARK 台股庫存同步成真實持倉（來源由 ark-setup 設定）")
     ap.add_argument("--dry-run", action="store_true", help="只顯示差異，不做任何寫入")
@@ -633,6 +655,8 @@ def main():
     print(f"\n完成 {ok} 項，失敗 {fail} 項")
     if args.with_cash and not sync_cash(ax, pid, cfg, api_sess):
         fail += 1
+    if screen_stale_after(api_sess is not None, applied):
+        refresh_screen(ax)                       # 放在現金之後：API 模式的現金寫入不靠畫面
     print("建議執行 --dry-run 再確認一次結果。")
     return 1 if fail else 0
 
