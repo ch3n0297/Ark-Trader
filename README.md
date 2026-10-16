@@ -54,6 +54,8 @@ API 與 AX 同時可用時，兩邊交叉比對；不一致則停手不寫入。
 
 `@` 後面是 marketplace 名稱（`marketplace.json` 的 `name`，即 `ark-trader`），不是 GitHub repo 名稱。
 
+裝好 plugin 後，**在終端機執行一次安裝腳本**（見下方「一個指令完成安裝」）。
+
 ### Codex
 
 ```bash
@@ -62,6 +64,39 @@ codex plugin add ark-trader
 ```
 
 本機開發改用 checkout 路徑：把上面的 `ch3n0297/Ark-Trader` 換成本機路徑。
+
+### 一個指令完成安裝（macOS 終端機）
+
+```bash
+bash ~/.claude/plugins/marketplaces/ark-trader/plugins/ark-trader/install.sh
+```
+
+Codex 或本機 checkout 改用該處的 `plugins/ark-trader/install.sh`。腳本流程寫死、不需要
+coding agent 介入：
+
+1. 確認 macOS
+2. 安裝 uv（有 Homebrew 用 brew，否則用官方安裝程式，落在 `~/.local/bin`）
+3. 預熱各腳本的 Python 與套件（第一次較久，之後 `uv run` 直接啟動）
+4. 檢查終端機的「輔助使用」權限，未授權時打開系統設定並等你授權
+5. 執行 ark-setup 設定帳戶（原生視窗，憑證不經對話）
+
+可重複執行；plugin 更新後再跑一次即可。`--skip-setup` 略過第 5 步。
+
+### 每日自動決策排程（選用）
+
+```bash
+bash ~/.claude/plugins/marketplaces/ark-trader/plugins/ark-trader/install.sh schedule          # 後端 simulation
+bash ~/.claude/plugins/marketplaces/ark-trader/plugins/ark-trader/install.sh schedule --live   # 自動送真錢委託
+bash ~/.claude/plugins/marketplaces/ark-trader/plugins/ark-trader/install.sh unschedule        # 移除
+```
+
+依這台機器的 uv 路徑、plugin 路徑與 `HOME` 從範本產生 launchd 排程（`local.ark-trader.*`：
+平日 10:00 decide、14:30 settle、週五 15:00 review、載入時跑一次 check）。送單後端只由
+`--live` 決定；`~/.ark-toolkit/agent.env` 的其他設定一併寫入，改了要重跑 `schedule`。
+`schedule --dry-run` 只印出產生的 plist。切 live 前先用 ark-start 驗證委託路徑。
+
+**正式下單只由你觸發**：排程，或你自己在終端機執行 `daily.py trade`（對 agent 說「開始交易」
+時，它會給你指令並監看回報，不會在對話中自己送單）。
 
 ### 更新
 
@@ -89,11 +124,12 @@ plugin 與 marketplace 已統一改名為 `ark-trader`，舊安裝不會自動�
 - 方舟運算已安裝並登入（未開啟會自動代為啟動）
 - 終端機/IDE 已取得「輔助使用」權限（系統設定 > 隱私權與安全性 > 輔助使用）
 - [uv](https://docs.astral.sh/uv/) — 各腳本以 PEP 723 宣告依賴，`uv run` 會自動準備
-  Python 與套件（uv 未裝時各 skill 會自動安裝）
+  Python 與套件（由 `install.sh` 安裝）
 
 ## 快速開始
 
-初次使用兩步：`ark-setup` 設定帳戶 > `ark-start` 驗證（模擬單通過後自動接實際看單）。
+初次使用：`install.sh`（含 `ark-setup` 設定帳戶）> `ark-start` 驗證（模擬單通過後自動接實際看單）。
+以下為從 repo checkout 根目錄手動執行的指令：
 
 ```bash
 uv run plugins/ark-trader/skills/ark-setup/setup.py             # 帳戶清單設定
@@ -138,7 +174,7 @@ cd plugins/ark-trader/skills/ark-sync    && PYTHONPATH=../../lib uv run --no-pro
 cd plugins/ark-trader/skills/ark-analyze && PYTHONPATH=../../lib uv run --no-project --python 3.13 python -m unittest test_analyze
 cd plugins/ark-trader/skills/ark-explore && PYTHONPATH=../../lib uv run --no-project --python 3.13 python -m unittest test_explore
 cd plugins/ark-trader/skills/ark-setup   && PYTHONPATH=../../lib uv run --no-project --python 3.13 --with openpyxl --with python-dotenv python -m unittest test_setup
-cd plugins/ark-trader/skills/ark-agent   && PYTHONPATH=../../lib uv run --no-project --python 3.13 python -m unittest test_market test_packet test_journal test_evaluate test_risk test_tracks test_equity test_execute test_daily test_phase0 test_review test_dividends test_gates
+cd plugins/ark-trader/skills/ark-agent   && PYTHONPATH=../../lib uv run --no-project --python 3.13 python -m unittest test_market test_packet test_journal test_evaluate test_risk test_tracks test_equity test_execute test_daily test_phase0 test_review test_dividends test_gates test_schedule
 cd plugins/ark-trader/skills/ark-agent   && PYTHONPATH=../../lib uv run --no-project --python 3.13 --with pyobjc-framework-cocoa --with pyobjc-framework-applicationservices --with pyobjc-framework-quartz python -m unittest test_record_return
 ```
 

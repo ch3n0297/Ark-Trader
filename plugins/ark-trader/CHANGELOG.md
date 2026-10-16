@@ -10,6 +10,22 @@
   `/plugin install ark-trader@ark-trader`；舊 README 寫的 `ark-toolkit@Ark-Trader` 拿 repo
   名稱當 marketplace 名稱，新機器照做必定失敗。舊安裝需移除後重裝（見 README「從舊名稱遷移」）。
   資料目錄 `~/.ark-toolkit/` 不改名，既有帳戶、憑證與決策日誌照常沿用。
+- **一個指令完成安裝：`install.sh`**（plugin 根目錄）。使用者在終端機執行，流程寫死：
+  確認 macOS → 安裝 uv（brew，失敗改官方安裝程式）→ 預熱各腳本的 Python 與套件 →
+  檢查輔助使用權限（未授權時開系統設定並等待）→ 執行 ark-setup。取代過去由各 skill
+  讓 agent 自行判斷「沒有 uv 就裝」的做法，每台機器結果一致。
+- **SKILL.md 腳本改用 `${CLAUDE_PLUGIN_ROOT}` 絕對路徑**：原本寫 `uv run skills/...`
+  相對路徑，plugin 裝好後 agent 的工作目錄是使用者專案，必定 `Failed to spawn: No such
+  file`。另附給 Codex／其他 agent 的換算說明；找不到 uv 時改為請使用者跑 `install.sh`。
+- **launchd 排程改為範本＋產生器**：`launchd/*.plist.in` 以佔位符取代寫死的個人路徑、
+  `/opt/homebrew/bin/uv` 與個人 label；`install.sh schedule` 依這台機器的 uv 路徑、plugin
+  連結（`~/.ark-toolkit/plugin`）與 `HOME` 產生並載入，label 改為 `local.ark-trader.*`，
+  `install.sh unschedule` 移除。送單後端只由 `--live` 決定（預設 simulation，agent.env 的
+  `ARK_BACKEND` 不影響排程），agent.env 其他設定一併寫入 plist；偵測到其他名稱的
+  ark-agent 舊排程即拒絕安裝並印出移除指令。新增 `schedule.py`／`test_schedule.py`。
+- **正式下單的觸發點交還使用者**：ark-agent 的「開始交易」改為 agent 只給出終端機指令、
+  監看 log 並回報；agent 在對話中不執行 `execute.py`、`daily.py decide`／`trade`、
+  `phase0.py --execute`，也不代為安裝排程。
 
 ## [2.0.1] - 2026-10-14
 
@@ -154,7 +170,7 @@
 
 ## [1.4.0] - 2026-09-04
 
-- **ark-agent 每週自動複盤**：`daily.py review`（launchd `com.hjc.ark-agent.review.plist`，
+- **ark-agent 每週自動複盤**：`daily.py review`（launchd review 排程，
   週五 15:00）依序跑 `review.py --out` 組本週案例 → 複盤層（`prompts/review.md`，只給
   Read／Write／Edit、不上網）寫檢討記錄到準則檔旁的 `decision-reviews/<date>.md` 並更新
   準則檔 → `rules_intact` 驗原有編號一條不少（改壞從 `~/.ark-toolkit/agent/reviews/

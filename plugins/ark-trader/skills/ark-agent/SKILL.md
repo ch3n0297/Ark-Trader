@@ -61,16 +61,21 @@ description: 自動交易決策軌：盤中產生決策包、Agent 依 ARK 紀�
 會以硬規則驗證：違規拒絕寫入，`--override` 可強制寫入但 `violations` 照記、紀律報告照列。
 自由度（賣哪幾檔、股數與建議的偏離、限價區間）不擋，事後由 evaluate 量測。
 
-## 執行環境（uv）
+## 執行環境（uv）與腳本路徑
 
 所有指令以 `uv run` 執行：依賴宣告在腳本開頭（PEP 723），uv 會自動準備 Python 與套件，
-機器不需要預先安裝 Python。執行前先確認 uv 存在，沒有就直接安裝後繼續（不必詢問使用者）：
+機器不需要預先安裝 Python。
 
-```bash
-command -v uv >/dev/null || brew install uv || curl -LsSf https://astral.sh/uv/install.sh | sh
-```
+- **腳本路徑**：指令中的 `${CLAUDE_PLUGIN_ROOT}` 是本 plugin 的根目錄（Claude Code 會自動代入，
+  即本 SKILL.md 往上兩層）。Codex 或其他 agent 若沒有這個變數：腳本在本 SKILL.md 所在資料夾
+  （其他 skill 的腳本在同層的 `../<skill>/`），請換算成絕對路徑執行。**不要用相對路徑**——
+  agent 的工作目錄是使用者的專案，`uv run skills/...` 會 `Failed to spawn: No such file`。
+- **找不到 uv**（`command -v uv` 與 `~/.local/bin/uv` 都沒有）：不要自行安裝，請使用者在
+  終端機執行一次安裝腳本（路徑換成絕對路徑給使用者），跑完再繼續：
 
-curl 安裝落在 `~/.local/bin`；若之後 shell 仍找不到 `uv`，改以 `~/.local/bin/uv` 呼叫。
+  ```bash
+  bash "${CLAUDE_PLUGIN_ROOT}/install.sh"
+  ```
 
 ## 每日流程
 
@@ -82,81 +87,111 @@ curl 安裝落在 `~/.local/bin`；若之後 shell 仍找不到 `uv`，改以 `~
 > 需要**當日已跑過 ark-collect**（快照僅當日有效），否則會停下要求先收集。
 > 全自動排程建議帳戶清單只留永豐 Shioaji。
 
+下面是 `daily.py` 內部依序執行的步驟，列出來是為了讓你看得懂 log、知道每步在做什麼，
+**不是要你在對話中逐一執行**。會送出委託的步驟（`execute.py`、`daily.py decide`／`trade`、
+`phase0.py --execute`）一律由排程或使用者在終端機觸發，見下方「下單觸發點」。
+
 ```bash
-# 10:00 決策執行
-uv run skills/ark-agent/packet.py            # 1. 事實（自動含：對帳不一致先 sync）
-uv run skills/ark-agent/risk.py              # 2. 執行邊界 envelope
+# 10:00 決策執行（daily.py decide）
+uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-agent/packet.py"            # 1. 事實（自動含：對帳不一致先 sync）
+uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-agent/risk.py"              # 2. 執行邊界 envelope
 #                                              3. ★ Agent 讀 packet+envelope → decision JSON
-uv run skills/ark-agent/journal.py record /tmp/decision.json   # 4. 紀律驗證＋鎖定
-uv run skills/ark-agent/execute.py --backend live              # 5. 送單
+uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-agent/journal.py" record /tmp/decision.json   # 4. 紀律驗證＋鎖定
+uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-agent/execute.py" --backend "$ARK_BACKEND"   # 5. 送單（僅 daily.py 呼叫）
 
 # 14:30 盤後結算（daily.py settle 依序跑這五步，每步盡力做完再回報）
-uv run skills/ark-agent/journal.py settle    # 1. 成交對回
-uv run skills/ark-agent/equity.py            # 2. 淨值與熔斷狀態
-uv run skills/ark-agent/dividends.py         # 3. 除權息資料（報酬校正用，須每日累積）
-uv run skills/ark-sync/sync.py --allow-delete --with-cash   # 4. 庫存與現金同步回 ARK
-uv run skills/ark-agent/record_return.py     # 5. 當日已實現獲利記進離職倒數（僅獲利日）
+uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-agent/journal.py" settle    # 1. 成交對回
+uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-agent/equity.py"            # 2. 淨值與熔斷狀態
+uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-agent/dividends.py"         # 3. 除權息資料（報酬校正用，須每日累積）
+uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-sync/sync.py" --allow-delete --with-cash   # 4. 庫存與現金同步回 ARK
+uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-agent/record_return.py"     # 5. 當日已實現獲利記進離職倒數（僅獲利日）
 
-# 不用排程、由人說「開始交易」才動：一場做完（盤中 09:00–13:00 開始）
-uv run skills/ark-agent/daily.py trade       # 對帳統一（sync --with-cash）→ 決策執行五步
+# 不用排程、由人說「開始交易」才動：一場做完（盤中 09:00–13:00 開始；使用者在終端機執行）
+uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-agent/daily.py" trade       # 對帳統一（sync --with-cash）→ 決策執行五步
 #                                              → execute --wait 30（等成交，逾時刪單並記 cancel）
 #                                              → 當日結算五步（journal settle --same-day 起）
 #                                              當日已有決策即拒絕；--wait 可調等待分鐘
 
 # 週五 15:00 複盤（daily.py review 依序跑：案例 → 複盤層 → 驗準則檔 → commit）
-uv run skills/ark-agent/review.py --out ~/.ark-toolkit/agent/reviews/<date>.txt
+uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-agent/review.py" --out ~/.ark-toolkit/agent/reviews/<date>.txt
 #                                              ★ 複盤層讀案例 → 寫檢討記錄、更新準則檔
 #                                              rules_intact 驗編號一條不少，壞了從備份還原
 
 # 隨時看成績
-uv run skills/ark-agent/evaluate.py          # --json 出機器格式；--offline 不連線
+uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-agent/evaluate.py"          # --json 出機器格式；--offline 不連線
 ```
 
 `journal.py settle` 現在會寫 `satellite_exits.jsonl`（衛星軌停損連續冷卻的依據），
 並把成交的個股桶買單自動指派進 `tracks.json` 的 satellite 軌；週五複盤可在
 `gates.py` 的區間與步幅內調整 `gates.json`，超出硬邊界由 `daily.py review` 自動還原。
 
+## 下單觸發點（硬規則）
+
+**你在對話中不執行任何會送出委託的指令**：`execute.py`、`daily.py decide`、`daily.py trade`、
+`phase0.py --execute`，不論 `ARK_BACKEND` 是 simulation 還是 live 都一樣——後端由使用者的
+`~/.ark-toolkit/agent.env` 與排程決定，對話中無法保證當下不是真錢。也不代為安裝或改動排程
+（`install.sh schedule`）。正式下單只有兩個觸發點，都在使用者手上：
+
+1. **排程**：使用者在終端機執行 `install.sh schedule`（見下方「排程安裝」）
+2. **手動一場**：使用者在終端機執行 `daily.py trade`（見下一節）
+
+只讀與驗證類指令照常可以由你執行：`packet.py`、`risk.py`、`evaluate.py`、`review.py`、
+`journal.py show`、`daily.py check`、`phase0.py`（不帶 `--execute`）、ark-start 的 `verify.py`
+（寫死 simulation）。
+
 ## 手動一場（使用者說「開始交易」）
 
-不用排程、由人觸發時走 `daily.py trade`。順序仍由程式寫死，你**只負責啟動、監看、回報**：
-不自己送單、不改 journal、不重跑第二場。
+不用排程、由人觸發時走 `daily.py trade`。順序由程式寫死；你**只負責給指令、監看、回報**：
+不自己執行、不自己送單、不改 journal、不重跑第二場。
 
 1. **先看時間**：交易日 **09:00–13:00** 才能開始（留 30 分等單＋結算，13:30 收盤前做完）。
-   不在窗內就告訴使用者現在幾點、為什麼不跑；**不要**用 `ARK_FORCE_WINDOW` 繞過。
-2. **載入個人設定，防睡眠、背景執行**。個人化設定（`ARK_RULES`、`ARK_NAMES_FLOOR`、
-   `ARK_NAMES_CAP`、`ARK_DECISION_MODEL`、`ARK_BACKEND`、`ARK_LAMP_EXIT`）放 `~/.ark-toolkit/agent.env`，
-   有就 source；沒有就走 repo 預設（`ARK_BACKEND` 預設 simulation，不會誤動真錢）：
+   不在窗內就告訴使用者現在幾點、為什麼不跑；**不要**建議用 `ARK_FORCE_WINDOW` 繞過。
+2. **把指令交給使用者，請他在終端機執行**。先把 `${CLAUDE_PLUGIN_ROOT}` 換成實際的絕對路徑
+   再給（使用者的終端機沒有這個變數）。指令會先載入 `~/.ark-toolkit/agent.env` 的個人化設定
+   （`ARK_RULES`、`ARK_NAMES_FLOOR`、`ARK_NAMES_CAP`、`ARK_DECISION_MODEL`、`ARK_BACKEND`、
+   `ARK_LAMP_EXIT`；沒有就走預設，`ARK_BACKEND` 預設 simulation），並以 `caffeinate` 防睡眠：
 
    ```bash
-   [ -f ~/.ark-toolkit/agent.env ] && { set -a; source ~/.ark-toolkit/agent.env; set +a; }
-   caffeinate -dis uv run skills/ark-agent/daily.py trade      # --wait N 可改等待分鐘
+   [ -f ~/.ark-toolkit/agent.env ] && { set -a; source ~/.ark-toolkit/agent.env; set +a; }; caffeinate -dis uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-agent/daily.py" trade
    ```
 
-   一場約 5–40 分（決策層約 5 分＋等成交最多 30 分），背景執行、輪詢 log。
-3. **監看** `~/.ark-toolkit/agent/daily.log` 尾段，三個檢查點：
+   `--wait N` 可改等待成交的分鐘數。一場約 5–40 分（決策層約 5 分＋等成交最多 30 分）。
+   給完指令先問清楚使用者的 `ARK_BACKEND` 是 simulation 還是 live，回報時要講明。
+3. **使用者說已經開始後，監看** `~/.ark-toolkit/agent/daily.log` 尾段（只讀），三個檢查點：
    - packet 摘要行「準則 N 條」須等於 `grep -c '^### R-' "$ARK_RULES"`
-     （未設時為 `~/.ark-toolkit/decision-rules.md`）；不等代表 env 沒載到，立刻 `pkill` 中止
-     ——這時決策尚未鎖定，重來不留痕
+     （未設時為 `~/.ark-toolkit/decision-rules.md`）；不等代表 env 沒載到，**立刻請使用者在
+     該終端機按 Ctrl-C 中止**——這時決策尚未鎖定，重來不留痕
    - envelope 行的熔斷等級與可買／可賣
    - execute 每腿的最終狀態（`→ Filled` 或 `（已刪單）`）——那就是券商回報
 4. **結束後回報**：讀 journal 當日的 `decision`／`execution`／`cancel`／`fill` 記錄，列出每筆單
    （動作、代號、股數、限價、成交價）、決策理由摘要、未成交或刪單的腿、結算五步有沒有哪步失敗。
 5. **`daily.py trade` 拒絕時**（當日已有決策、不在時窗、對帳同步失敗）那是正確行為，照實回報
-   原因，不要繞過。同日只認第一筆決策。
+   原因，不要建議繞過。同日只認第一筆決策。
 
 `trade` 與 `decide`／`settle` 排程互斥：兩者都會做決策，同日第二筆會被 `trade` 拒絕、
-被排程標 `amended`。用 `trade` 就把排程 `launchctl bootout`＋`disable`。
+被排程標 `amended`。要改用 `trade`，請使用者先在終端機執行 `install.sh unschedule` 移除排程。
 
 ## 排程安裝（launchd）
 
-```bash
-cp skills/ark-agent/launchd/*.plist ~/Library/LaunchAgents/
-for j in decide settle review; do launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hjc.ark-agent.$j.plist; done
+排程由使用者在終端機執行安裝腳本的子指令，依這台機器的 uv 路徑、plugin 路徑與 `HOME`
+從 `launchd/*.plist.in` 範本產生 plist 並載入（label 前綴 `local.ark-trader.`）。你只把指令
+（換成絕對路徑後）交給使用者，不代為執行：
 
-# 改動排程或系統升級後，在真正的 launchd 環境下驗一次前置條件
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hjc.ark-agent.check.plist
-cat ~/.ark-toolkit/agent/launchd.check.out
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/install.sh" schedule          # decide／settle／review／check，後端 simulation
+bash "${CLAUDE_PLUGIN_ROOT}/install.sh" schedule --live   # 自動送真錢委託（切 live 前先跑 ark-start）
+bash "${CLAUDE_PLUGIN_ROOT}/install.sh" unschedule        # 移除全部排程
 ```
+
+- 送單後端只由 `--live` 決定；`~/.ark-toolkit/agent.env` 的其他設定（`ARK_RULES`、
+  `ARK_DECISION_MODEL` 等）在產生 plist 時一併寫入，改了 agent.env 要重跑 `schedule`
+- plist 經由 `~/.ark-toolkit/plugin`（指向 plugin 根目錄的連結）呼叫 `daily.py`，plugin 更新後
+  重跑一次 `install.sh` 即可讓排程跟上
+- `check` 載入時立即跑一次前置檢查（真正的 launchd 環境下驗 AX 權限與券商連線），結果看
+  `~/.ark-toolkit/agent/launchd.check.out`；之後要重驗：
+  `launchctl kickstart -k gui/$(id -u)/local.ark-trader.check`
+- `~/Library/LaunchAgents/` 裡若有其他名稱的 ark-agent 舊排程，`schedule` 會拒絕安裝並印出
+  移除指令——兩套排程同時跑會在同一天做兩次決策
 
 ⚠️ **launchd 的進入點必須是 `uv`，不能是 `/bin/bash`。** macOS 封鎖系統二進位檔
 在 launchd 下存取 `~/Documents` 等 TCC 保護目錄（防止用腳本繞過權限）——實測
@@ -164,8 +199,8 @@ cat ~/.ark-toolkit/agent/launchd.check.out
 `uv` 這類第三方 binary 有自己的 TCC 身分，讀得到。AX（輔助使用）權限在 launchd
 下則正常，實測 `AXIsProcessTrusted() = True`。
 
-`decide` 不補跑（`StartCalendarIntervalRunAtLoad=false`）：10:00 的判斷在 13:00
-執行是另一回事，盤中價格早已不同。`settle` 會補跑——那是對既成事實的記錄，
+`decide` 不補跑：10:00 的判斷在 13:00 執行是另一回事，盤中價格早已不同（`daily.py` 的
+`in_window()` 守 ±60 分）。`settle` 會補跑——那是對既成事實的記錄，
 晚幾小時做結果一樣，漏做卻會讓熔斷基準斷掉。
 
 ## 軌道模型
@@ -254,12 +289,13 @@ evaluate 只輸出點估計＋樣本數＋pending 筆數；60 日前瞻報酬要
 - `risk.py` — 風控層：熔斷、軌道配額、衛星軌停損、金額上限 → 執行邊界 envelope
 - `gates.py` — 個股桶閘門（預設、區間、步幅、檔案驗證）；閘門檔 gates.json 預設放在準則檔旁
 - `execute.py` — 下單層：股數→張數換算、價格檔位對齊、送出前檢查、`place_order`
-- `daily.py` — 每日編排（decide／settle／check），順序寫死；launchd 的進入點
+- `daily.py` — 每日編排（decide／settle／trade／review／check），順序寫死；launchd 的進入點
+- `schedule.py` — 由 `launchd/*.plist.in` 範本產生並載入／移除排程（`install.sh schedule` 呼叫）
 - `preflight.py` — 前置檢查（AX 權限、券商連線），無副作用只讀
 - `phase0.py` — 開局整理（一次性、有人監督、預設 dry-run）。**豁免金額上限**，
   因為那些上限是為了限制無人值守時的爆炸半徑；紀律照守，繼承軌一股不賣。
   刻意獨立成一支腳本而非在 execute.py 開繞過旗標——那種旗標日後一定會被誤用
-- `prompts/decide.md`／`prompts/review.md` — 決策層與複盤層的提示模板；`launchd/` — 四份排程設定
+- `prompts/decide.md`／`prompts/review.md` — 決策層與複盤層的提示模板；`launchd/` — 四份排程範本（`*.plist.in`）
 - 委託路徑實機驗證在 **ark-start** skill（`skills/ark-start/verify.py`，寫死 simulation，
   碰不到真錢）——切 live 前先跑它
 - 持久化：`~/.ark-toolkit/agent/`（packets/、envelopes/、prices/、journal.jsonl、
@@ -268,7 +304,7 @@ evaluate 只輸出點估計＋樣本數＋pending 筆數；60 日前瞻報酬要
 測試（純邏輯，不需要 ARK 或 Shioaji，任何平台可跑）：
 
 ```bash
-cd skills/ark-agent && PYTHONPATH=../../lib uv run --no-project --python 3.13 python -m unittest test_market test_packet test_journal test_evaluate test_risk test_tracks test_equity test_execute test_daily test_phase0 test_gates test_review -v
+cd skills/ark-agent && PYTHONPATH=../../lib uv run --no-project --python 3.13 python -m unittest test_market test_packet test_journal test_evaluate test_risk test_tracks test_equity test_execute test_daily test_phase0 test_gates test_review test_schedule -v
 ```
 
 ## 前置需求

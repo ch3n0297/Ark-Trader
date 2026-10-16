@@ -1,17 +1,19 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- 範本：由 schedule.py（install.sh schedule）代入 @…@ 佔位符後寫到
+     ~/Library/LaunchAgents/，不要直接複製本檔。 -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.hjc.ark-agent.review</string>
+  <string>@LABEL@</string>
 
   <key>ProgramArguments</key>
   <array>
-    <!-- 進入點必須是 uv 而非 /bin/bash（TCC），理由見 decide.plist -->
-    <string>/opt/homebrew/bin/uv</string>
+    <!-- 進入點必須是 uv 而非 /bin/bash（TCC），理由見 decide.plist.in -->
+    <string>@UV@</string>
     <string>run</string>
-    <string>/Users/hjc/Documents/Stock/plugin/plugins/ark-trader/skills/ark-agent/daily.py</string>
+    <string>@DAILY@</string>
     <string>review</string>
   </array>
 
@@ -23,23 +25,20 @@
   </array>
 
   <key>WorkingDirectory</key>
-  <string>/Users/hjc/Documents/Stock</string>
+  <string>@WORKDIR@</string>
 
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/hjc/.local/bin</string>
+    <string>@PATH@</string>
     <key>HOME</key>
-    <string>/Users/hjc</string>
-    <!-- 複盤模型：與決策同級——它寫的準則會直接影響隔天的判斷 -->
-    <key>ARK_DECISION_MODEL</key>
-    <string>fable</string>
-    <!-- 準則檔位置與 decide.plist 的 ARK_RULES 保持一致；未設則用 ~/.ark-toolkit/decision-rules.md -->
-  </dict>
+    <string>@HOME@</string>
+    <!-- ~/.ark-toolkit/agent.env 的個人化設定（ARK_RULES、ARK_DECISION_MODEL…）於產生時代入 -->
+@EXTRA_ENV@  </dict>
 
   <key>StandardOutPath</key>
-  <string>/Users/hjc/.ark-toolkit/agent/launchd.review.out</string>
+  <string>@LOG_DIR@/launchd.review.out</string>
   <key>StandardErrorPath</key>
-  <string>/Users/hjc/.ark-toolkit/agent/launchd.review.err</string>
+  <string>@LOG_DIR@/launchd.review.err</string>
 </dict>
 </plist>

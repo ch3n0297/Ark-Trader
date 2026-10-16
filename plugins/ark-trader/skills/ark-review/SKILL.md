@@ -59,7 +59,7 @@ description: 決策複盤：把一段期間的決策、當時理由、成交與�
 ## 自動化（每週五）
 
 上述流程 1～5 由 `ark-agent/daily.py review` 每週五 15:00 自動跑（launchd
-`com.hjc.ark-agent.review.plist`）：`review.py --out` 組案例 → 複盤層（`prompts/review.md`，
+`local.ark-trader.review`，由使用者以 `install.sh schedule` 安裝）：`review.py --out` 組案例 → 複盤層（`prompts/review.md`，
 只給 Read／Write／Edit）寫檢討記錄並更新準則檔 → `rules_intact` 驗原有編號一條不少
 （壞了從 `~/.ark-toolkit/agent/reviews/<date>.rules.bak` 還原）→ git commit → 通知。
 在對話裡手動複盤仍照本 skill 走；兩者寫的是同一份準則檔。
@@ -75,18 +75,22 @@ description: 決策複盤：把一段期間的決策、當時理由、成交與�
 
 ## 指令
 
+`${CLAUDE_PLUGIN_ROOT}` 是本 plugin 的根目錄（Claude Code 會自動代入，即本 SKILL.md 往上兩層）。
+Codex 或其他 agent 若沒有這個變數：`review.py` 在本 SKILL.md 同層的 `../ark-agent/`，
+請換算成絕對路徑執行，不要以使用者專案為工作目錄用相對路徑呼叫。
+
 ```bash
 # 最近 7 天（預設）
-uv run review.py
+uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-agent/review.py"
 
 # 指定期間，用 T+20 做準則歸因
-uv run review.py --since 2026-08-11 --until 2026-08-15 --horizon 20
+uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-agent/review.py" --since 2026-08-11 --until 2026-08-15 --horizon 20
 
 # 機器可讀
-uv run review.py --json
+uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-agent/review.py" --json
 
 # 不連券商，只用本地日K快取
-uv run review.py --offline
+uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-agent/review.py" --offline
 ```
 
 ## 測試

@@ -1,25 +1,27 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- 範本：由 schedule.py（install.sh schedule）代入 @…@ 佔位符後寫到
+     ~/Library/LaunchAgents/，不要直接複製本檔。 -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.hjc.ark-agent.check</string>
+  <string>@LABEL@</string>
 
   <!-- 隨選的前置檢查，沒有排程時段。用途是在**真正的 launchd 環境**下驗證
        輔助使用權限與券商連線——AX 權限按執行檔授權，Terminal 有不代表
-       launchd job 有。改動排程或系統升級後跑一次：
+       launchd job 有。載入時跑一次；改動排程或系統升級後重跑：
 
-         launchctl kickstart -k gui/$(id -u)/com.hjc.ark-agent.check
+         launchctl kickstart -k gui/$(id -u)/@LABEL@
   -->
   <key>ProgramArguments</key>
   <array>
     <!-- 進入點必須是 uv 而非 /bin/bash：macOS 封鎖系統二進位檔在 launchd 下
          存取 ~/Documents 等受保護目錄（防止用腳本繞過 TCC），實測 /bin/bash
          連讀取 daily.py 都會 Operation not permitted。 -->
-    <string>/opt/homebrew/bin/uv</string>
+    <string>@UV@</string>
     <string>run</string>
-    <string>/Users/hjc/Documents/Stock/plugin/plugins/ark-trader/skills/ark-agent/daily.py</string>
+    <string>@DAILY@</string>
     <string>check</string>
   </array>
 
@@ -27,21 +29,22 @@
   <true/>
 
   <key>WorkingDirectory</key>
-  <string>/Users/hjc/Documents/Stock</string>
+  <string>@WORKDIR@</string>
 
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/hjc/.local/bin</string>
+    <string>@PATH@</string>
     <key>HOME</key>
-    <string>/Users/hjc</string>
+    <string>@HOME@</string>
     <key>ARK_BACKEND</key>
-    <string>simulation</string>
-  </dict>
+    <string>@BACKEND@</string>
+    <!-- ~/.ark-toolkit/agent.env 的個人化設定（ARK_RULES、ARK_DECISION_MODEL…）於產生時代入 -->
+@EXTRA_ENV@  </dict>
 
   <key>StandardOutPath</key>
-  <string>/Users/hjc/.ark-toolkit/agent/launchd.check.out</string>
+  <string>@LOG_DIR@/launchd.check.out</string>
   <key>StandardErrorPath</key>
-  <string>/Users/hjc/.ark-toolkit/agent/launchd.check.err</string>
+  <string>@LOG_DIR@/launchd.check.err</string>
 </dict>
 </plist>

@@ -112,7 +112,7 @@ class TestQuotaExhausted(unittest.TestCase):
     def test_其他失敗為假(self):
         for out in ("", "Error: connection refused",
                     "提示模板有未取代的佔位符：['MYSTERY_PATH']",
-                    "✅ 決策已寫入 /Users/hjc/.ark-toolkit/agent/decisions/x.json"):
+                    "✅ 決策已寫入 /Users/someone/.ark-toolkit/agent/decisions/x.json"):
             self.assertFalse(daily.is_quota_exhausted(out), out)
 
 

@@ -22,19 +22,26 @@ description: 兩階段同步的階段一：收集永豐 Shioaji 與各檔案帳�
 2. 執行時會彈原生視窗（確認、選檔），請提醒使用者留意畫面（可能被其他視窗遮住），
    Bash 逾時設長（建議 10 分鐘）
 
-## 執行環境（uv）
+## 執行環境（uv）與腳本路徑
 
-所有指令以 `uv run` 執行：依賴宣告在腳本開頭（PEP 723），uv 會自動準備 Python 與套件。
-執行前先確認 uv 存在，沒有就直接安裝後繼續（不必詢問使用者）：
+所有指令以 `uv run` 執行：依賴宣告在腳本開頭（PEP 723），uv 會自動準備 Python 與套件，
+機器不需要預先安裝 Python。
 
-```bash
-command -v uv >/dev/null || brew install uv || curl -LsSf https://astral.sh/uv/install.sh | sh
-```
+- **腳本路徑**：指令中的 `${CLAUDE_PLUGIN_ROOT}` 是本 plugin 的根目錄（Claude Code 會自動代入，
+  即本 SKILL.md 往上兩層）。Codex 或其他 agent 若沒有這個變數：腳本在本 SKILL.md 所在資料夾
+  （其他 skill 的腳本在同層的 `../<skill>/`），請換算成絕對路徑執行。**不要用相對路徑**——
+  agent 的工作目錄是使用者的專案，`uv run skills/...` 會 `Failed to spawn: No such file`。
+- **找不到 uv**（`command -v uv` 與 `~/.local/bin/uv` 都沒有）：不要自行安裝，請使用者在
+  終端機執行一次安裝腳本（路徑換成絕對路徑給使用者），跑完再繼續：
+
+  ```bash
+  bash "${CLAUDE_PLUGIN_ROOT}/install.sh"
+  ```
 
 ## 用法
 
 ```bash
-uv run skills/ark-collect/collect.py
+uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-collect/collect.py"
 ```
 
 流程：（第一次）問 ARK 均價口徑 → 讀永豐（API，套用口徑）→ 逐一讀檔案帳戶 →

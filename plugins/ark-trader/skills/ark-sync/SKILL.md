@@ -35,27 +35,32 @@ ARK 沒有官方 API，本 skill 透過 macOS Accessibility API 操作 App 的 U
 3. 已執行 `ark-setup` 設定帳戶清單（Shioaji 需 API 憑證，由精靈以原生視窗收集；檔案帳戶不需憑證）；含檔案帳戶時當日已跑過 `ark-collect`
 4. **執行期間 ARK 視窗保持可見即可**（不必前景，可繼續用電腦）—— 隱藏（Cmd+H）或最小化會讓它被 iOS 生命週期暫停、AX 全部失效。所有操作走 AX action 與 `CGEventPostToPid`，不動游標、不佔鍵盤焦點
 
-## 執行環境（uv）
+## 執行環境（uv）與腳本路徑
 
 所有指令以 `uv run` 執行：依賴宣告在腳本開頭（PEP 723），uv 會自動準備 Python 與套件，
-機器不需要預先安裝 Python。執行前先確認 uv 存在，沒有就直接安裝後繼續（不必詢問使用者）：
+機器不需要預先安裝 Python。
 
-```bash
-command -v uv >/dev/null || brew install uv || curl -LsSf https://astral.sh/uv/install.sh | sh
-```
+- **腳本路徑**：指令中的 `${CLAUDE_PLUGIN_ROOT}` 是本 plugin 的根目錄（Claude Code 會自動代入，
+  即本 SKILL.md 往上兩層）。Codex 或其他 agent 若沒有這個變數：腳本在本 SKILL.md 所在資料夾
+  （其他 skill 的腳本在同層的 `../<skill>/`），請換算成絕對路徑執行。**不要用相對路徑**——
+  agent 的工作目錄是使用者的專案，`uv run skills/...` 會 `Failed to spawn: No such file`。
+- **找不到 uv**（`command -v uv` 與 `~/.local/bin/uv` 都沒有）：不要自行安裝，請使用者在
+  終端機執行一次安裝腳本（路徑換成絕對路徑給使用者），跑完再繼續：
 
-curl 安裝落在 `~/.local/bin`；若之後 shell 仍找不到 `uv`，改以 `~/.local/bin/uv` 呼叫。
+  ```bash
+  bash "${CLAUDE_PLUGIN_ROOT}/install.sh"
+  ```
 
 ## 用法
 
 一律先 dry-run 確認差異，再實際執行：
 
 ```bash
-uv run skills/ark-sync/sync.py --dry-run        # 只顯示差異，不寫入
-uv run skills/ark-sync/sync.py                  # 執行（略過刪除）
-uv run skills/ark-sync/sync.py --allow-delete   # 含刪除
-uv run skills/ark-sync/sync.py --allow-delete --force   # 略過安全閘
-uv run skills/ark-sync/sync.py --no-prompt      # 排程用：缺均價口徑時不開視窗
+uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-sync/sync.py" --dry-run        # 只顯示差異，不寫入
+uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-sync/sync.py"                  # 執行（略過刪除）
+uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-sync/sync.py" --allow-delete   # 含刪除
+uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-sync/sync.py" --allow-delete --force   # 略過安全閘
+uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-sync/sync.py" --no-prompt      # 排程用：缺均價口徑時不開視窗
 ```
 
 刪除預設略過，需明確加旗標。執行後再跑一次 `--dry-run` 確認結果。
@@ -68,7 +73,7 @@ uv run skills/ark-sync/sync.py --no-prompt      # 排程用：缺均價口徑時
 每筆帶 read-after-write 讀回驗證取代「總成本」見證：
 
 ```bash
-ARK_API_WRITES=1 uv run skills/ark-sync/sync.py --with-cash   # 庫存與現金都走 API 寫入
+ARK_API_WRITES=1 uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-sync/sync.py" --with-cash   # 庫存與現金都走 API 寫入
 ```
 
 API 寫入不碰編輯頁、較快且不受畫面捲動／解析脆弱性影響；失敗（含讀回不符）與 AX 同樣

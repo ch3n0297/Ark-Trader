@@ -23,22 +23,27 @@ description: ark-trader 帳戶清單設定精靈：以 macOS 原生視窗管理�
    `source` 後 echo 等任何形式）。憑證只由 Python 腳本在執行期載入。
 3. `setup.py` 的 stdout 只含進度與結果訊息，不含機密，可安心顯示給使用者。
 
-## 執行環境（uv）
+## 執行環境（uv）與腳本路徑
 
 所有指令以 `uv run` 執行：依賴宣告在腳本開頭（PEP 723），uv 會自動準備 Python 與套件，
-機器不需要預先安裝 Python。執行前先確認 uv 存在，沒有就直接安裝後繼續（不必詢問使用者）：
+機器不需要預先安裝 Python。
 
-```bash
-command -v uv >/dev/null || brew install uv || curl -LsSf https://astral.sh/uv/install.sh | sh
-```
+- **腳本路徑**：指令中的 `${CLAUDE_PLUGIN_ROOT}` 是本 plugin 的根目錄（Claude Code 會自動代入，
+  即本 SKILL.md 往上兩層）。Codex 或其他 agent 若沒有這個變數：腳本在本 SKILL.md 所在資料夾
+  （其他 skill 的腳本在同層的 `../<skill>/`），請換算成絕對路徑執行。**不要用相對路徑**——
+  agent 的工作目錄是使用者的專案，`uv run skills/...` 會 `Failed to spawn: No such file`。
+- **找不到 uv**（`command -v uv` 與 `~/.local/bin/uv` 都沒有）：不要自行安裝，請使用者在
+  終端機執行一次安裝腳本（路徑換成絕對路徑給使用者），跑完再繼續：
 
-curl 安裝落在 `~/.local/bin`；若之後 shell 仍找不到 `uv`，改以 `~/.local/bin/uv` 呼叫。
+  ```bash
+  bash "${CLAUDE_PLUGIN_ROOT}/install.sh"
+  ```
 
 ## 用法
 
 ```bash
-uv run skills/ark-setup/setup.py           # 開啟原生視窗精靈
-uv run skills/ark-setup/setup.py --show    # 只顯示目前設定（不開視窗）
+uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-setup/setup.py"           # 開啟原生視窗精靈
+uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-setup/setup.py" --show    # 只顯示目前設定（不開視窗）
 ```
 
 > 執行精靈時，視窗會等使用者操作，請把 Bash 逾時設長（建議 10 分鐘），

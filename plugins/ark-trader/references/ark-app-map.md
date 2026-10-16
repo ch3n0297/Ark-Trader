@@ -459,7 +459,7 @@ ARK 不是下單軟體，**它沒有券商連線**。它是一套把「該不該
 ## 重跑這份地圖
 
 ```bash
-uv run skills/ark-explore/run.py            # 版本沒變就跳過
-uv run skills/ark-explore/run.py --force    # 強制重跑
-uv run skills/ark-explore/run.py --show     # 只看快取，不碰 App
+uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-explore/run.py"            # 版本沒變就跳過
+uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-explore/run.py" --force    # 強制重跑
+uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-explore/run.py" --show     # 只看快取，不碰 App
 ```
