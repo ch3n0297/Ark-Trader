@@ -93,6 +93,32 @@ class TestPathAndEnv(unittest.TestCase):
         self.assertEqual(len(parts), len(set(parts)))
         self.assertIn("/usr/bin", parts)
 
+    def test_PATH帶codex與claude兩個目錄(self):
+        path = schedule.build_path(HOME, UV, HOME + "/.nvm/versions/node/v22/bin/codex",
+                                   HOME + "/.local/bin/claude")
+        parts = path.split(":")
+        self.assertEqual(parts[:3], ["/opt/homebrew/bin", HOME + "/.nvm/versions/node/v22/bin",
+                                     HOME + "/.local/bin"])
+
+    def test_決策CLI預設claude_可切codex(self):
+        self.assertEqual(schedule.decision_cli({}), "claude")
+        self.assertEqual(schedule.decision_cli({"ARK_DECISION_CLI": ""}), "claude")
+        self.assertEqual(schedule.decision_cli({"ARK_DECISION_CLI": "codex"}), "codex")
+        with self.assertRaises(ValueError):
+            schedule.decision_cli({"ARK_DECISION_CLI": "gemini"})
+
+    def test_要找的CLI跟著排程與切換走(self):
+        self.assertEqual(schedule.needed_clis("claude", schedule.JOBS), ["claude"])
+        self.assertEqual(schedule.needed_clis("codex", schedule.JOBS), ["codex", "claude"])
+        self.assertEqual(schedule.needed_clis("codex", ["decide", "settle"]), ["codex"])
+        self.assertEqual(schedule.needed_clis("codex", ["settle"]), [])
+
+    def test_ARK_DECISION_CLI與其他設定一樣寫進plist(self):
+        env = rendered("decide", extra={"ARK_DECISION_CLI": "codex",
+                                        "ARK_DECISION_MODEL": "gpt-5"})["EnvironmentVariables"]
+        self.assertEqual(env["ARK_DECISION_CLI"], "codex")
+        self.assertEqual(env["ARK_DECISION_MODEL"], "gpt-5")
+
     def test_env0解析(self):
         self.assertEqual(schedule.parse_env0(b"A=1\0B=x=y\0\0"), {"A": "1", "B": "x=y"})
 

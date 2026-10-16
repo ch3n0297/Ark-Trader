@@ -17,9 +17,10 @@
     daily.py review    週五 15:00　本週案例 → 檢討並更新準則 → 驗準則檔 → commit
     daily.py check     隨選　　　　前置檢查（無副作用，只讀）
 
-**LLM 只佔 decide 的第 3 步，而且不給 Bash 工具**——它產出 decision.json 之後
-就沒有話語權，紀律驗證與送單由後面兩步負責。若讓 LLM 自己編排整條流程，它可能
-「忘記」跑風控或驗證，硬規則就不再是硬的。
+**LLM 只佔 decide 的第 3 步，而且不給 Bash 工具**（`ARK_DECISION_CLI=codex` 時改走
+`codex exec` 的唯讀沙箱）——它產出 decision.json 之後就沒有話語權，紀律驗證與
+送單由後面兩步負責。若讓 LLM 自己編排整條流程，它可能「忘記」跑風控或驗證，
+硬規則就不再是硬的。
 
 **為什麼是 Python 而不是 shell**：macOS 刻意封鎖系統二進位檔（`/bin/bash`）在
 launchd 下對 `~/Documents` 等受保護目錄的存取，以防有人用腳本繞過 TCC。實測
@@ -60,11 +61,36 @@ MODES = ("decide", "settle", "trade", "review", "check")
 # packet.py 的離開碼 3＝休市（國定假日）：今天不交易，不是故障（值與 packet.MARKET_CLOSED_EXIT 相同）
 PACKET_MARKET_CLOSED = 3
 
-# 決策模型。無人值守下要動真錢，判斷品質是最不該省的地方。
-DECISION_MODEL = os.environ.get("ARK_DECISION_MODEL", "fable")
+# 決策層用哪支模型 CLI：claude（預設，`claude -p`）或 codex（`codex exec`，唯讀沙箱）。
+# 只管 decide／trade 的第 3 步；週複盤要改準則檔，固定走 claude（見 review）。
+CLAUDE, CODEX = "claude", "codex"
+DECISION_CLIS = (CLAUDE, CODEX)
+
+# claude 的預設模型。無人值守下要動真錢，判斷品質是最不該省的地方。
+CLAUDE_MODEL = "fable"
+
+
+def model_settings(env):
+    """環境變數 → (決策 CLI, 決策模型, 複盤模型)。
+
+    ARK_DECISION_CLI 未設或空白＝claude（不認得的值原樣回傳，由 main 擋下）。
+    決策模型有設 ARK_DECISION_MODEL 就用；沒設時 claude 用 fable，codex 為 None
+    （不帶 -m，用 Codex 自己的預設模型——claude 的模型名對 codex 沒有意義）。
+    複盤固定走 claude：決策層切到 codex 時 ARK_DECISION_MODEL 是 codex 的模型名，
+    不能拿來用，改回 claude 的預設。
+    """
+    cli = env.get("ARK_DECISION_CLI", "").strip() or CLAUDE
+    configured = env.get("ARK_DECISION_MODEL", "").strip()
+    model = configured or (CLAUDE_MODEL if cli == CLAUDE else None)
+    review = model if cli == CLAUDE else CLAUDE_MODEL
+    return cli, model, review
+
+
+DECISION_CLI, DECISION_MODEL, REVIEW_MODEL = model_settings(os.environ)
 
 # 主模型撞到用量上限時的接手模型。額度是跟著模型走的，撞牆那天會整天不交易，
 # 實驗數據就多一個與市場無關的缺口——換一個額度池把當天補回來。
+# 只用在 claude：額度判斷認的是 claude CLI 的訊息（見 is_quota_exhausted）。
 FALLBACK_MODEL = os.environ.get("ARK_DECISION_FALLBACK", "opus")
 
 
@@ -224,6 +250,78 @@ def fallback_model(code, output, current, fallback):
     return fallback if is_quota_exhausted(output) else None
 
 
+# codex 的決策層在唯讀沙箱裡（寫不了檔、指令連不了網），決策 JSON 改由最終訊息交回、
+# daily.py 代寫到 DECISION_PATH。接在 decide.md 之後，蓋掉「寫到檔案」那段的作法。
+CODEX_DECISION_SUFFIX = """
+
+## 交回決策的方式（覆寫上面「寫出決策」的作法）
+
+你在唯讀沙箱裡，**不能寫檔**，也不能、不需要送出任何委託——紀律驗證與送單由後面的
+腳本負責。上面要你寫到 `{decision}` 的那份決策 JSON，改成直接當作你的**最終訊息**
+輸出：只輸出那一個 JSON 物件本身，格式與欄位照上面的範例，前後不要加任何說明文字，
+也不要包在 code fence 裡。排程程式會把它寫進檔案。
+"""
+
+
+def model_command(cli, prompt, model, tools):
+    """組模型 CLI 的指令列。兩種 CLI 各一個分支，都只讓模型「讀資料、產出決策」：
+
+    - claude：`claude -p`，只給 `tools`（不含 Bash），由模型用 Write 寫決策檔。
+    - codex：`codex exec`，**固定唯讀沙箱**（模型產生的指令寫不了檔、連不了網，送不了單），
+      stdout 只有最終訊息（進度在 stderr）。`--ignore-user-config` 不讀
+      `$CODEX_HOME/config.toml`——排程結果不隨個人設定（沙箱、核准、模型…）漂移；
+      排程目錄不是 git repo，要 `--skip-git-repo-check`；新聞要即時的，
+      `web_search` 設 live（預設是 cached）。不讀個人設定時推理強度會落到 none，
+      無人值守下動真錢的判斷最不該省，寫死 xhigh。`model` 為 None 就不帶 `-m`。
+
+    codex 只接決策層：複盤要改準則檔，給它寫入權限就打破「決策層唯讀」這條不變量。
+    """
+    if cli == CLAUDE:
+        return ["claude", "-p", prompt,
+                "--model", model,
+                "--allowedTools", *tools,
+                "--permission-mode", "acceptEdits",
+                "--output-format", "text"]
+    if cli == CODEX:
+        if any(t in tools for t in ("Edit", "Bash")):
+            raise ValueError("codex 只接唯讀的決策層，不給寫入或 Bash 類工具")
+        cmd = ["codex", "exec",
+               "--sandbox", "read-only",
+               "--ignore-user-config",
+               "--skip-git-repo-check",
+               "--color", "never",
+               "-c", 'web_search="live"',
+               "-c", 'model_reasoning_effort="xhigh"']
+        if model:
+            cmd += ["-m", model]
+        return cmd + [prompt]
+    raise ValueError(f"未知的決策 CLI：{cli!r}（可用 {'、'.join(DECISION_CLIS)}）")
+
+
+def parse_decision_output(text):
+    """codex 最終訊息 → 決策 dict。容忍整段被包在 ```json fence 裡；其他雜訊一律不認——
+    猜著從一段話裡挖 JSON，挖錯了就是一筆不是模型本意的決策。格式與紀律由 journal 驗。"""
+    body = text.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*\n(.*?)\n?```", body, re.S)
+    if fenced:
+        body = fenced.group(1).strip()
+    try:
+        obj = json.loads(body)
+    except ValueError as exc:
+        raise ValueError(f"決策輸出不是 JSON：{exc}") from None
+    if not isinstance(obj, dict):
+        raise ValueError("決策輸出不是 JSON 物件")
+    return obj
+
+
+def required_clis(cli):
+    """前置檢查要找的 CLI：(缺了就不過, 缺了只提醒)。codex 模式的決策層不用 claude，
+    但週複盤仍走 claude——缺了只影響週五，不該擋掉每天的決策。"""
+    if cli == CODEX:
+        return [CODEX], [CLAUDE]
+    return [CLAUDE], []
+
+
 def settle_failures(results):
     """[(步驟名, 離開碼)] → 失敗的步驟名。
 
@@ -299,23 +397,31 @@ DECIDE_TOOLS = ("Read", "Write", "WebSearch", "WebFetch")
 REVIEW_TOOLS = ("Read", "Write", "Edit")       # 改準則檔要 Edit；複盤不上網
 
 
-def ask_model(mode, prompt, model, tools=DECIDE_TOOLS, cwd=STATE):
-    """LLM 插槽：只給讀檔／寫檔／查新聞，**不給 Bash**——它無法自行送單或改紀錄。
-    回傳 (離開碼, 輸出)，輸出同時進 daily.log。
+def ask_model(mode, prompt, model, tools=DECIDE_TOOLS, cwd=STATE, cli=CLAUDE):
+    """LLM 插槽：只給讀檔／寫檔／查新聞，**不給 Bash**——它無法自行送單或改紀錄
+    （codex 則是唯讀沙箱，見 model_command）。回傳 (離開碼, 輸出)，輸出同時進 daily.log。
 
     先收進記憶體再寫檔而非直接導向 log：額度耗盡與其他故障都是非零離開，
-    要分辨只能看輸出內容。
+    要分辨只能看輸出內容。codex 的 stdout 只有最終訊息（決策 JSON），進度在
+    stderr——兩者分開收，回傳的輸出只取 stdout。
+
+    stdin 一律接 /dev/null：`codex exec` 見到非 TTY 的 stdin 會讀到 EOF 才開始
+    （把內容附加到提示後），繼承到一條不會關的 pipe／socket 就永遠卡住。
     """
-    log(mode, f"呼叫 claude（{model}）…")
-    proc = subprocess.run(
-        ["claude", "-p", prompt,
-         "--model", model,
-         "--allowedTools", *tools,
-         "--permission-mode", "acceptEdits",
-         "--output-format", "text"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, cwd=cwd, check=False)
+    cmd = model_command(cli, prompt, model, tools)
+    log(mode, f"呼叫 {cli}（{model or '預設模型'}）…")
+    split = cli == CODEX
+    try:
+        proc = subprocess.run(
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE if split else subprocess.STDOUT,
+            text=True, cwd=cwd, check=False)
+    except FileNotFoundError:
+        log(mode, f"🛑 找不到 {cli} CLI")
+        return 127, ""
     with open(LOG, "a", encoding="utf-8") as fh:
+        if split and proc.stderr:
+            fh.write(proc.stderr)
         fh.write(proc.stdout)
     return proc.returncode, proc.stdout
 
@@ -362,14 +468,28 @@ def _decide_steps(mode, date, backend, execute, wait_minutes):
     with open(os.path.join(HERE, "prompts", "decide.md"), encoding="utf-8") as fh:
         prompt = render_prompt(fh.read(), packet, envelope, decision, date)
 
-    rc, out = ask_model(mode, prompt, DECISION_MODEL)
-    successor = fallback_model(rc, out, DECISION_MODEL, FALLBACK_MODEL)
+    cli = DECISION_CLI
+    if cli == CODEX:
+        prompt += CODEX_DECISION_SUFFIX.format(decision=decision)
+
+    rc, out = ask_model(mode, prompt, DECISION_MODEL, cli=cli)
+    successor = fallback_model(rc, out, DECISION_MODEL, FALLBACK_MODEL) if cli == CLAUDE else None
     if successor:
         notify(mode, f"⚠️ {DECISION_MODEL} 額度耗盡，改用 {successor} 重試")
-        rc, out = ask_model(mode, prompt, successor)
+        rc, out = ask_model(mode, prompt, successor, cli=cli)
     if rc != 0:
-        notify(mode, "🛑 決策產生失敗（claude 非零離開）")
+        notify(mode, f"🛑 決策產生失敗（{cli} 非零離開）")
         return 1
+    if cli == CODEX:
+        # 解析失敗就在這裡停：當天若有舊的決策檔，不能讓它冒充這次的輸出
+        try:
+            parsed = parse_decision_output(out)
+        except ValueError as exc:
+            notify(mode, f"🛑 {exc}（未送出任何委託）")
+            return 1
+        with open(decision, "w", encoding="utf-8") as fh:
+            json.dump(parsed, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
     if not os.path.exists(decision):
         notify(mode, f"🛑 決策檔未產生：{decision}")
         return 1
@@ -546,10 +666,11 @@ def review(date):
         prompt = render_review_prompt(fh.read(), report, rules, doc, date, gates_path=gates_path)
 
     cwd = os.path.dirname(rules)          # acceptEdits 只自動放行工作目錄內的改動
-    rc, out = ask_model(mode, prompt, DECISION_MODEL, tools=REVIEW_TOOLS, cwd=cwd)
-    successor = fallback_model(rc, out, DECISION_MODEL, FALLBACK_MODEL)
+    # 複盤固定走 claude（REVIEW_MODEL）：要 Edit 準則檔，codex 的唯讀沙箱做不到
+    rc, out = ask_model(mode, prompt, REVIEW_MODEL, tools=REVIEW_TOOLS, cwd=cwd)
+    successor = fallback_model(rc, out, REVIEW_MODEL, FALLBACK_MODEL)
     if successor:
-        notify(mode, f"⚠️ {DECISION_MODEL} 額度耗盡，改用 {successor} 重試")
+        notify(mode, f"⚠️ {REVIEW_MODEL} 額度耗盡，改用 {successor} 重試")
         rc, out = ask_model(mode, prompt, successor, tools=REVIEW_TOOLS, cwd=cwd)
     # 先驗閘門：模型跑完就可能已經改壞 gates.json，任何提前 return 都不能跳過還原
     if guard_gates(gates_path, gates_before, mode):
@@ -577,15 +698,23 @@ def review(date):
     return 0
 
 
+def has_cli(name):
+    return subprocess.run(["which", name], capture_output=True, check=False).returncode == 0
+
+
 def check(backend):
     mode = "check"
     bad = []
     if subprocess.run(["pgrep", "-x", "Arkeration"],
                       capture_output=True, check=False).returncode != 0:
         bad.append("方舟運算 App 未執行")
-    if subprocess.run(["which", "claude"],
-                      capture_output=True, check=False).returncode != 0:
-        bad.append("找不到 claude")
+    required, optional = required_clis(DECISION_CLI)
+    for name in required:
+        if not has_cli(name):
+            bad.append(f"找不到 {name}（ARK_DECISION_CLI={DECISION_CLI}）")
+    for name in optional:
+        if not has_cli(name):
+            log(mode, f"⚠️ 找不到 {name}：決策層不受影響，但週複盤（review）仍需 {name}")
     if run(mode, os.path.join(HERE, "preflight.py")) != 0:
         bad.append("preflight 未過（詳見 daily.log）")
     if bad:
@@ -607,6 +736,11 @@ def main():
 
     date = args.date or dt.date.today().isoformat()
     backend = os.environ.get("ARK_BACKEND", "simulation")
+    if args.mode in ("decide", "trade", "check") and DECISION_CLI not in DECISION_CLIS:
+        # 在任何一步之前擋：trade 的第一步就會寫 ARK App，設定錯不該走到那裡
+        notify(args.mode, f"🛑 ARK_DECISION_CLI 只能是 {'、'.join(DECISION_CLIS)}，"
+                          f"現在是 {DECISION_CLI!r}")
+        return 1
     if args.mode == "decide":
         return decide(date, backend, execute=not args.no_execute)
     if args.mode == "settle":

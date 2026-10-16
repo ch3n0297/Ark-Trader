@@ -26,6 +26,18 @@
 - **正式下單的觸發點交還使用者**：ark-agent 的「開始交易」改為 agent 只給出終端機指令、
   監看 log 並回報；agent 在對話中不執行 `execute.py`、`daily.py decide`／`trade`、
   `phase0.py --execute`，也不代為安裝排程。
+- **ark-agent：決策層可改用 Codex CLI（`ARK_DECISION_CLI=codex`）**。預設仍是 `claude -p`；
+  設成 `codex` 時 decide／trade 第 3 步改呼叫 `codex exec --sandbox read-only
+  --ignore-user-config --skip-git-repo-check -c web_search="live"
+  -c model_reasoning_effort="xhigh"`（不讀個人設定時推理強度預設是 none，實測），
+  `ARK_DECISION_MODEL` 未設就不帶 `-m`（用 Codex 預設模型）、不做額度降級。stdin 一律接
+  `/dev/null`——實測 `codex exec` 遇到不會關的 stdin pipe 會一直等下去。唯讀沙箱寫不了檔，決策 JSON 由最終訊息
+  （stdout，進度在 stderr）交回、`daily.py` 代寫決策檔後照常交 journal 驗證；輸出不是單一 JSON
+  物件就視為失敗、不送單。指令組成抽成純函式 `model_command`，測試守住「codex 分支不帶
+  workspace-write／danger-full-access／免沙箱旗標」。`daily.py check` 與 `schedule` 跟著切換
+  找對應的 CLI 並帶進 launchd PATH；週複盤要改準則檔，固定走 claude（codex 模式下用 `fable`）。
+  不認得的 `ARK_DECISION_CLI` 在任何一步之前擋下。`ARK_DECISION_MODEL` 設為空字串時改視同未設
+  （過去會帶 `--model ""`）。
 
 ## [2.0.1] - 2026-10-14
 

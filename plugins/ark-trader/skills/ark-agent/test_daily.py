@@ -545,3 +545,223 @@ class TestReviewRecordsOnlyOnSuccess(unittest.TestCase):
         self.assertEqual(records[0]["since"], "2026-09-28")
         self.assertTrue(records[0]["ok"])
         self.assertEqual(done[-1], self.DATE)
+
+
+class TestDecisionCli(unittest.TestCase):
+    """ARK_DECISION_CLI：claude（預設）或 codex。不論哪支，決策層都只產出決策 JSON，
+    送單永遠是後面 execute.py 的事——codex 那支一定是唯讀沙箱。"""
+
+    PROMPT = "你是 ark-agent 的決策層"
+
+    def test_claude指令與原本相同(self):
+        cmd = daily.model_command("claude", self.PROMPT, "fable", daily.DECIDE_TOOLS)
+        self.assertEqual(cmd, ["claude", "-p", self.PROMPT, "--model", "fable",
+                               "--allowedTools", "Read", "Write", "WebSearch", "WebFetch",
+                               "--permission-mode", "acceptEdits", "--output-format", "text"])
+        self.assertNotIn("Bash", cmd)
+
+    def test_codex用exec_唯讀沙箱_不讀個人設定(self):
+        cmd = daily.model_command("codex", self.PROMPT, "gpt-5", daily.DECIDE_TOOLS)
+        self.assertEqual(cmd[:2], ["codex", "exec"])
+        self.assertEqual(cmd[cmd.index("--sandbox") + 1], "read-only")
+        self.assertIn("--ignore-user-config", cmd)
+        self.assertIn("--skip-git-repo-check", cmd)
+        self.assertEqual(cmd[cmd.index("-m") + 1], "gpt-5")
+
+    def test_codex推理強度寫死xhigh(self):
+        """實測：--ignore-user-config 下推理強度預設是 none"""
+        for model in (None, "gpt-5"):
+            cmd = daily.model_command("codex", self.PROMPT, model, daily.DECIDE_TOOLS)
+            overrides = [cmd[i + 1] for i, a in enumerate(cmd[:-1]) if a == "-c"]
+            self.assertIn('model_reasoning_effort="xhigh"', overrides)
+            self.assertIn('web_search="live"', overrides)
+        self.assertEqual(cmd[-1], self.PROMPT)
+
+    def test_codex未設模型就不帶m(self):
+        cmd = daily.model_command("codex", self.PROMPT, None, daily.DECIDE_TOOLS)
+        self.assertNotIn("-m", cmd)
+        self.assertNotIn("--model", cmd)
+
+    def test_codex決策層不得有寫入或免沙箱旗標(self):
+        """不變量：決策層只輸出 JSON。寫入沙箱或略過沙箱，模型就有機會自己送單"""
+        for model in (None, "gpt-5"):
+            cmd = daily.model_command("codex", self.PROMPT, model, daily.DECIDE_TOOLS)
+            joined = " ".join(cmd[:-1])                  # 最後一個是提示本文
+            for banned in ("workspace-write", "danger-full-access",
+                           "--dangerously-bypass-approvals-and-sandbox", "--yolo",
+                           "--full-auto", "--approve-for-me", "--not-so-yolo"):
+                self.assertNotIn(banned, joined)
+            self.assertEqual(cmd.count("--sandbox"), 1)
+            self.assertNotIn("-s", cmd)
+
+    def test_codex不接複盤的寫入工具(self):
+        with self.assertRaises(ValueError):
+            daily.model_command("codex", self.PROMPT, None, daily.REVIEW_TOOLS)
+
+    def test_未知CLI報錯(self):
+        with self.assertRaises(ValueError):
+            daily.model_command("gemini", self.PROMPT, None, daily.DECIDE_TOOLS)
+
+    def test_預設值_未設時走claude與fable(self):
+        self.assertEqual(daily.model_settings({}), ("claude", "fable", "fable"))
+        self.assertEqual(daily.model_settings({"ARK_DECISION_CLI": " "}),
+                         ("claude", "fable", "fable"))
+
+    def test_claude模式沿用ARK_DECISION_MODEL(self):
+        self.assertEqual(daily.model_settings({"ARK_DECISION_MODEL": "opus"}),
+                         ("claude", "opus", "opus"))
+
+    def test_codex未設模型就用Codex預設(self):
+        self.assertEqual(daily.model_settings({"ARK_DECISION_CLI": "codex"}),
+                         ("codex", None, "fable"))
+
+    def test_codex模式下複盤仍用claude的預設模型(self):
+        self.assertEqual(daily.model_settings({"ARK_DECISION_CLI": "codex",
+                                               "ARK_DECISION_MODEL": "gpt-5"}),
+                         ("codex", "gpt-5", "fable"))
+
+    def test_不認得的CLI在任何一步之前擋下(self):
+        """trade 第一步就會寫 ARK App，設定錯不該走到那裡"""
+        for mode in ("decide", "trade", "check"):
+            with mock.patch.object(daily, "DECISION_CLI", "gemini"), \
+                 mock.patch.object(daily.sys, "argv", ["daily.py", mode]), \
+                 mock.patch.object(daily, "run") as run, \
+                 mock.patch.object(daily, "notify", lambda *a, **k: None):
+                self.assertEqual(daily.main(), 1, mode)
+            run.assert_not_called()
+
+    def test_preflight分流(self):
+        self.assertEqual(daily.required_clis("claude"), (["claude"], []))
+        self.assertEqual(daily.required_clis("codex"), (["codex"], ["claude"]))
+
+
+class TestParseDecisionOutput(unittest.TestCase):
+    def test_純JSON(self):
+        self.assertEqual(daily.parse_decision_output('\n{"no_trade": true, "orders": []}\n'),
+                         {"no_trade": True, "orders": []})
+
+    def test_整段包在fence裡也認(self):
+        self.assertEqual(daily.parse_decision_output('```json\n{"a": 1}\n```'), {"a": 1})
+
+    def test_夾雜說明文字不認(self):
+        with self.assertRaises(ValueError):
+            daily.parse_decision_output('決策如下：\n{"a": 1}')
+
+    def test_非物件不認(self):
+        with self.assertRaises(ValueError):
+            daily.parse_decision_output("[1, 2]")
+        with self.assertRaises(ValueError):
+            daily.parse_decision_output("")
+
+
+class TestCheckFollowsDecisionCli(unittest.TestCase):
+    """前置檢查找的是決策層用的那支 CLI；codex 模式缺 claude 只提醒（複盤要用），不擋"""
+
+    def run_check(self, cli, present):
+        notes, logs = [], []
+        with mock.patch.object(daily, "DECISION_CLI", cli), \
+             mock.patch.object(daily, "has_cli", side_effect=lambda n: n in present), \
+             mock.patch.object(daily, "run", return_value=0), \
+             mock.patch.object(daily, "notify", lambda mode, msg: notes.append(msg)), \
+             mock.patch.object(daily, "log", lambda mode, msg: logs.append(msg)), \
+             mock.patch.object(daily.subprocess, "run",
+                               return_value=mock.Mock(returncode=0)):
+            rc = daily.check("simulation")
+        return rc, notes, logs
+
+    def test_claude模式找claude(self):
+        rc, notes, _ = self.run_check("claude", {"codex"})
+        self.assertEqual(rc, 1)
+        self.assertIn("找不到 claude", notes[-1])
+
+    def test_codex模式找codex(self):
+        rc, notes, _ = self.run_check("codex", {"claude"})
+        self.assertEqual(rc, 1)
+        self.assertIn("找不到 codex", notes[-1])
+
+    def test_codex模式缺claude只提醒(self):
+        rc, notes, logs = self.run_check("codex", {"codex"})
+        self.assertEqual(rc, 0)
+        self.assertTrue(any("claude" in m and "review" in m for m in logs))
+
+
+class TestCodexDecideStep(unittest.TestCase):
+    """codex 的決策 JSON 從 stdout 來，由 daily.py 代寫決策檔，再交給 journal 驗"""
+
+    DATE = "2026-10-16"
+
+    def setUp(self):
+        self.state = tempfile.mkdtemp()
+        for sub in ("packets", "envelopes"):
+            os.makedirs(os.path.join(self.state, sub))
+            with open(os.path.join(self.state, sub, f"{self.DATE}.json"), "w") as fh:
+                fh.write("{}")
+
+    def decide(self, output, rc=0):
+        calls, prompts = [], []
+
+        def fake_model(mode, prompt, model, tools=None, cwd=None, cli=None):
+            prompts.append((prompt, model, cli))
+            return rc, output
+        with mock.patch.object(daily, "STATE", self.state), \
+             mock.patch.object(daily, "DECISION_CLI", "codex"), \
+             mock.patch.object(daily, "DECISION_MODEL", None), \
+             mock.patch.object(daily, "run", lambda mode, *a: calls.append(a) or 0), \
+             mock.patch.object(daily, "ask_model", fake_model), \
+             mock.patch.object(daily, "notify", lambda *a, **k: None):
+            result = daily._decide_steps("decide", self.DATE, "simulation", False, None)
+        return result, calls, prompts
+
+    def decision_path(self):
+        return os.path.join(self.state, "decisions", f"{self.DATE}.json")
+
+    def test_stdout的JSON寫成決策檔再交journal驗(self):
+        result, calls, prompts = self.decide('{"date": "2026-10-16", "no_trade": true, "orders": []}')
+        self.assertEqual(result, 0)
+        with open(self.decision_path(), encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["no_trade"], True)
+        self.assertEqual(calls[-1][1:], ("record", self.decision_path()))
+        prompt, model, cli = prompts[0]
+        self.assertEqual(cli, "codex")
+        self.assertIsNone(model)
+        self.assertIn("唯讀沙箱", prompt)
+        self.assertIn(self.decision_path(), prompt)
+
+    def test_輸出不是JSON就停_不寫檔不送單(self):
+        result, calls, _ = self.decide("我決定今天不動。")
+        self.assertEqual(result, 1)
+        self.assertFalse(os.path.exists(self.decision_path()))
+        self.assertFalse(any(str(c[0]).endswith(("journal.py", "execute.py")) for c in calls))
+
+    def test_codex非零離開不降級(self):
+        """接手模型是 claude 的模型名，codex 撞牆時不能拿它重試"""
+        result, _, prompts = self.decide("/usage-credits", rc=1)
+        self.assertEqual(result, 1)
+        self.assertEqual(len(prompts), 1)
+
+
+class TestAskModelProcess(unittest.TestCase):
+    """實測：codex exec 見到非 TTY 的 stdin 會讀到 EOF 才開始，繼承到不會關的 pipe 就永遠卡住"""
+
+    def call(self, cli):
+        proc = mock.Mock(returncode=0, stdout='{"a": 1}', stderr="進度")
+        with mock.patch.object(daily.subprocess, "run", return_value=proc) as run, \
+             mock.patch.object(daily, "log", lambda *a, **k: None):
+            rc, out = daily.ask_model("decide", "提示", None if cli == "codex" else "fable",
+                                      cli=cli)
+        return rc, out, run.call_args.kwargs
+
+    def test_stdin一律接devnull(self):
+        for cli in ("claude", "codex"):
+            _, _, kw = self.call(cli)
+            self.assertIs(kw["stdin"], daily.subprocess.DEVNULL, cli)
+
+    def test_codex的stderr不混進回傳的決策輸出(self):
+        rc, out, kw = self.call("codex")
+        self.assertIs(kw["stderr"], daily.subprocess.PIPE)
+        self.assertEqual(out, '{"a": 1}')
+
+    def test_找不到CLI回127(self):
+        with mock.patch.object(daily.subprocess, "run", side_effect=FileNotFoundError), \
+             mock.patch.object(daily, "log", lambda *a, **k: None):
+            self.assertEqual(daily.ask_model("decide", "提示", None, cli="codex"), (127, ""))

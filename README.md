@@ -93,6 +93,11 @@ bash ~/.claude/plugins/marketplaces/ark-trader/plugins/ark-trader/install.sh uns
 依這台機器的 uv 路徑、plugin 路徑與 `HOME` 從範本產生 launchd 排程（`local.ark-trader.*`：
 平日 10:00 decide、14:30 settle、週五 15:00 review、載入時跑一次 check）。送單後端只由
 `--live` 決定；`~/.ark-toolkit/agent.env` 的其他設定一併寫入，改了要重跑 `schedule`。
+
+決策層預設呼叫 `claude -p`；在 agent.env 寫 `ARK_DECISION_CLI=codex` 改用 Codex CLI 的
+`codex exec`（唯讀沙箱、不讀個人 `config.toml`、推理強度寫死 `xhigh`，`ARK_DECISION_MODEL`
+未設就用 Codex 預設模型）。兩者都只產出決策 JSON，送單仍由排程的 execute.py 負責；週五的複盤層固定走 claude。
+細節見 ark-agent 的 SKILL.md「決策層 CLI」。
 `schedule --dry-run` 只印出產生的 plist。切 live 前先用 ark-start 驗證委託路徑。
 
 **正式下單只由你觸發**：排程，或你自己在終端機執行 `daily.py trade`（對 agent 說「開始交易」

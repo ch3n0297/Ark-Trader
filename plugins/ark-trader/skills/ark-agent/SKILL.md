@@ -148,8 +148,8 @@ uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-agent/evaluate.py"          # --json �
    不在窗內就告訴使用者現在幾點、為什麼不跑；**不要**建議用 `ARK_FORCE_WINDOW` 繞過。
 2. **把指令交給使用者，請他在終端機執行**。先把 `${CLAUDE_PLUGIN_ROOT}` 換成實際的絕對路徑
    再給（使用者的終端機沒有這個變數）。指令會先載入 `~/.ark-toolkit/agent.env` 的個人化設定
-   （`ARK_RULES`、`ARK_NAMES_FLOOR`、`ARK_NAMES_CAP`、`ARK_DECISION_MODEL`、`ARK_BACKEND`、
-   `ARK_LAMP_EXIT`；沒有就走預設，`ARK_BACKEND` 預設 simulation），並以 `caffeinate` 防睡眠：
+   （`ARK_RULES`、`ARK_NAMES_FLOOR`、`ARK_NAMES_CAP`、`ARK_DECISION_CLI`、`ARK_DECISION_MODEL`、
+   `ARK_BACKEND`、`ARK_LAMP_EXIT`；沒有就走預設，`ARK_BACKEND` 預設 simulation），並以 `caffeinate` 防睡眠：
 
    ```bash
    [ -f ~/.ark-toolkit/agent.env ] && { set -a; source ~/.ark-toolkit/agent.env; set +a; }; caffeinate -dis uv run "${CLAUDE_PLUGIN_ROOT}/skills/ark-agent/daily.py" trade
@@ -184,7 +184,37 @@ bash "${CLAUDE_PLUGIN_ROOT}/install.sh" unschedule        # 移除全部排程
 ```
 
 - 送單後端只由 `--live` 決定；`~/.ark-toolkit/agent.env` 的其他設定（`ARK_RULES`、
-  `ARK_DECISION_MODEL` 等）在產生 plist 時一併寫入，改了 agent.env 要重跑 `schedule`
+  `ARK_DECISION_CLI`、`ARK_DECISION_MODEL` 等）在產生 plist 時一併寫入，改了 agent.env 要重跑 `schedule`
+- PATH 帶入決策層 CLI（claude 或 codex）所在目錄；有排 review 時另帶 claude。找不到時
+  `schedule` 會警告，裝好後重跑
+
+## 決策層 CLI（`ARK_DECISION_CLI`）
+
+decide／trade 第 3 步呼叫哪支模型 CLI，由 `~/.ark-toolkit/agent.env` 寫死，不由對話中的
+agent 判斷。兩種都**只產出決策 JSON、不送單**——紀律驗證與送單仍是後面的 journal／execute：
+
+| `ARK_DECISION_CLI` | 指令 | 權限 | `ARK_DECISION_MODEL` 未設時 |
+|---|---|---|---|
+| `claude`（預設） | `claude -p` | 只給 Read／Write／WebSearch／WebFetch，不給 Bash；模型自己寫決策檔 | `fable`（額度耗盡改 `ARK_DECISION_FALLBACK`，預設 `opus`） |
+| `codex` | `codex exec --sandbox read-only --ignore-user-config --skip-git-repo-check -c web_search="live" -c model_reasoning_effort="xhigh"` | 唯讀沙箱：寫不了檔、指令連不了網；決策 JSON 由最終訊息（stdout）交回，`daily.py` 代寫決策檔 | 不帶 `-m`，用 Codex 預設模型；不做額度降級 |
+
+```bash
+# ~/.ark-toolkit/agent.env
+ARK_DECISION_CLI=codex
+# ARK_DECISION_MODEL=<codex 的模型名>   # 不設就用 Codex 預設
+```
+
+- `--ignore-user-config`：不讀 `$CODEX_HOME/config.toml`，排程結果不隨個人設定漂移
+  （登入仍沿用 `CODEX_HOME` 的憑證，排程前先在終端機登入 codex）。個人設定裡的沙箱、
+  核准、模型與推理強度都不會帶進來
+- 推理強度寫死 `xhigh`：不讀個人設定時預設會落到 `none`
+- stdin 一律接 `/dev/null`：`codex exec` 見到非 TTY 的 stdin 會等讀到 EOF 才開始，繼承到
+  不會關的 pipe 就永遠卡住
+- codex 的最終訊息必須是單一 JSON 物件（允許整段包在一個 json code fence 裡）；夾雜說明文字就
+  視為決策失敗、不寫檔、不送單
+- **週複盤（review）固定走 claude**：它要 Edit 準則檔，codex 決策層的唯讀沙箱做不到。
+  codex 模式下複盤用 claude 的預設模型 `fable`；`daily.py check` 缺 claude 只記警告、不擋決策
+- 其他值（例如拼錯）`daily.py` 在 decide／trade／check 任何一步之前就擋下，`schedule` 拒絕安裝
 - plist 經由 `~/.ark-toolkit/plugin`（指向 plugin 根目錄的連結）呼叫 `daily.py`，plugin 更新後
   重跑一次 `install.sh` 即可讓排程跟上
 - `check` 載入時立即跑一次前置檢查（真正的 launchd 環境下驗 AX 權限與券商連線），結果看
@@ -295,7 +325,8 @@ evaluate 只輸出點估計＋樣本數＋pending 筆數；60 日前瞻報酬要
 - `phase0.py` — 開局整理（一次性、有人監督、預設 dry-run）。**豁免金額上限**，
   因為那些上限是為了限制無人值守時的爆炸半徑；紀律照守，繼承軌一股不賣。
   刻意獨立成一支腳本而非在 execute.py 開繞過旗標——那種旗標日後一定會被誤用
-- `prompts/decide.md`／`prompts/review.md` — 決策層與複盤層的提示模板；`launchd/` — 四份排程範本（`*.plist.in`）
+- `prompts/decide.md`／`prompts/review.md` — 決策層與複盤層的提示模板（codex 模式另在
+  `daily.py` 接上「改由最終訊息交回 JSON」的段落）；`launchd/` — 四份排程範本（`*.plist.in`）
 - 委託路徑實機驗證在 **ark-start** skill（`skills/ark-start/verify.py`，寫死 simulation，
   碰不到真錢）——切 live 前先跑它
 - 持久化：`~/.ark-toolkit/agent/`（packets/、envelopes/、prices/、journal.jsonl、
