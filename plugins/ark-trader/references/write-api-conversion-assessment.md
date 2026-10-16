@@ -1,6 +1,6 @@
 # 寫入操作轉 API 評估
 
-本文評估把 ark-toolkit 目前走 Accessibility(AX) 的 **ARK 寫入操作** 轉成直接呼叫
+本文評估把 ark-trader 目前走 Accessibility(AX) 的 **ARK 寫入操作** 轉成直接呼叫
 ARK API 的可行性、證據、未知數與落地設計。對應 1.9.0 已完成的讀取轉 API。
 
 > 定位：這是**評估與設計**，不是已接線的功能。在下方「落地前必須先做的事」完成前，

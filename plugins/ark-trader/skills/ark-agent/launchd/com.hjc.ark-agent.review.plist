@@ -11,7 +11,7 @@
     <!-- 進入點必須是 uv 而非 /bin/bash（TCC），理由見 decide.plist -->
     <string>/opt/homebrew/bin/uv</string>
     <string>run</string>
-    <string>/Users/hjc/Documents/Stock/plugin/plugins/ark-toolkit/skills/ark-agent/daily.py</string>
+    <string>/Users/hjc/Documents/Stock/plugin/plugins/ark-trader/skills/ark-agent/daily.py</string>
     <string>review</string>
   </array>
 

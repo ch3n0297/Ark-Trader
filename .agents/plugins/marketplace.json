@@ -1,14 +1,14 @@
 {
-  "name": "ark-tools",
+  "name": "ark-trader",
   "interface": {
     "displayName": "ARK Tools"
   },
   "plugins": [
     {
-      "name": "ark-toolkit",
+      "name": "ark-trader",
       "source": {
         "source": "local",
-        "path": "./plugins/ark-toolkit"
+        "path": "./plugins/ark-trader"
       },
       "policy": {
         "installation": "AVAILABLE"

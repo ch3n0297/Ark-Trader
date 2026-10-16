@@ -7,7 +7,7 @@ import subprocess
 
 import source
 
-TITLE = "ark-toolkit 設定"
+TITLE = "ark-trader 設定"
 
 FIELD_LABELS = {"code": "股票代號", "qty": "股數", "price": "成交均價"}
 

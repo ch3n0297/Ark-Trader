@@ -19,7 +19,7 @@
          連讀取 daily.py 都會 Operation not permitted。 -->
     <string>/opt/homebrew/bin/uv</string>
     <string>run</string>
-    <string>/Users/hjc/Documents/Stock/plugin/plugins/ark-toolkit/skills/ark-agent/daily.py</string>
+    <string>/Users/hjc/Documents/Stock/plugin/plugins/ark-trader/skills/ark-agent/daily.py</string>
     <string>check</string>
   </array>
 

@@ -1,9 +1,15 @@
 # Changelog
 
-本檔記錄 ark-toolkit 的版本沿革。版本語意：主版號＝正式里程碑，
+本檔記錄 ark-trader（原名 ark-toolkit）的版本沿革。版本語意：主版號＝正式里程碑，
 次版號＝行為或語意變更，修訂號＝bug 修正。
 
 ## [Unreleased]
+
+- **改名：plugin 與 marketplace 統一為 `ark-trader`**（原 plugin `ark-toolkit`、marketplace
+  `ark-tools`），與 GitHub repo `Ark-Trader` 一致。安裝指令改為
+  `/plugin install ark-trader@ark-trader`；舊 README 寫的 `ark-toolkit@Ark-Trader` 拿 repo
+  名稱當 marketplace 名稱，新機器照做必定失敗。舊安裝需移除後重裝（見 README「從舊名稱遷移」）。
+  資料目錄 `~/.ark-toolkit/` 不改名，既有帳戶、憑證與決策日誌照常沿用。
 
 ## [2.0.1] - 2026-10-14
 

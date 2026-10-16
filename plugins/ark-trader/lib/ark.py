@@ -95,7 +95,7 @@ class Posture(NamedTuple):
         return self.actual_ratio - self.suggested_ratio
 
 
-def check_platform(platform=None, tool="ark-toolkit"):
+def check_platform(platform=None, tool="ark-trader"):
     """本工具依賴 macOS Accessibility API 與 Apple Silicon 的 iOS App 相容層。"""
     p = platform if platform is not None else sys.platform
     if p != "darwin":

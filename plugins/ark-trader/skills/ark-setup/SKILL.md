@@ -1,6 +1,6 @@
 ---
 name: ark-setup
-description: ark-toolkit 帳戶清單設定精靈：以 macOS 原生視窗管理「真實持倉」帳戶（永豐 Shioaji API＋任意個 CSV/Excel 檔案帳戶；空清單＝純 ARK 模式）並安全收集 API 憑證。當使用者初次安裝、要新增／移除帳戶、更新金鑰，或其他 ark skill 回報「尚未設定真實持倉來源」時使用。僅限 macOS。
+description: ark-trader 帳戶清單設定精靈：以 macOS 原生視窗管理「真實持倉」帳戶（永豐 Shioaji API＋任意個 CSV/Excel 檔案帳戶；空清單＝純 ARK 模式）並安全收集 API 憑證。當使用者初次安裝、要新增／移除帳戶、更新金鑰，或其他 ark skill 回報「尚未設定真實持倉來源」時使用。僅限 macOS。
 ---
 
 # ark-setup

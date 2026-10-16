@@ -1,6 +1,6 @@
 """ax.find 的純邏輯測試（AX 樹以假物件注入；需要 pyobjc 才 import 得了 ax，僅 macOS 可跑）
 
-執行：cd plugin/plugins/ark-toolkit && PYTHONPATH=lib uv run python -m unittest test_ax -v
+執行：cd plugin/plugins/ark-trader && PYTHONPATH=lib uv run python -m unittest test_ax -v
 """
 import unittest
 from unittest import mock

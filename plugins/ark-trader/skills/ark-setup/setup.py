@@ -6,7 +6,7 @@
 #     "openpyxl",
 # ]
 # ///
-"""ark-toolkit 帳戶清單設定精靈。
+"""ark-trader 帳戶清單設定精靈。
 
 管理「真實持倉」的帳戶清單：永豐 Shioaji API＋任意個檔案帳戶（CSV／Excel）。
 清單為空＝純 ARK 模式（不對帳）。
@@ -172,7 +172,7 @@ def run_wizard():
 
 
 def main():
-    ap = argparse.ArgumentParser(description="ark-toolkit 帳戶清單設定精靈（macOS 原生視窗）")
+    ap = argparse.ArgumentParser(description="ark-trader 帳戶清單設定精靈（macOS 原生視窗）")
     ap.add_argument("--show", action="store_true", help="只顯示目前設定（不開視窗、不含機密）")
     args = ap.parse_args()
 

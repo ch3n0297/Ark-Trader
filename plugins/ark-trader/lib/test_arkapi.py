@@ -1,6 +1,6 @@
 """arkapi 的純邏輯測試（不連網、不需要 ARK 執行中，任何平台可跑）
 
-執行：cd plugin/plugins/ark-toolkit/lib && uv run --no-project --python 3.13 python -m unittest test_arkapi -v
+執行：cd plugin/plugins/ark-trader/lib && uv run --no-project --python 3.13 python -m unittest test_arkapi -v
 """
 import base64
 import datetime as dt

@@ -49,14 +49,16 @@ API 與 AX 同時可用時，兩邊交叉比對；不一致則停手不寫入。
 
 ```bash
 /plugin marketplace add ch3n0297/Ark-Trader
-/plugin install ark-toolkit@Ark-Trader
+/plugin install ark-trader@ark-trader
 ```
+
+`@` 後面是 marketplace 名稱（`marketplace.json` 的 `name`，即 `ark-trader`），不是 GitHub repo 名稱。
 
 ### Codex
 
 ```bash
 codex plugin marketplace add ch3n0297/Ark-Trader
-codex plugin add ark-toolkit
+codex plugin add ark-trader
 ```
 
 本機開發改用 checkout 路徑：把上面的 `ch3n0297/Ark-Trader` 換成本機路徑。
@@ -64,9 +66,22 @@ codex plugin add ark-toolkit
 ### 更新
 
 ```bash
-/plugin marketplace update Ark-Trader          # Claude Code
-codex plugin marketplace upgrade Ark-Trader    # Codex
+/plugin marketplace update ark-trader          # Claude Code
+codex plugin marketplace upgrade ark-trader    # Codex
 ```
+
+### 從舊名稱遷移（2.0.1 以前為 `ark-toolkit@ark-tools`）
+
+plugin 與 marketplace 已統一改名為 `ark-trader`，舊安裝不會自動跟上，需移除後重裝：
+
+```bash
+/plugin uninstall ark-toolkit@ark-tools
+/plugin marketplace remove ark-tools
+/plugin marketplace add ch3n0297/Ark-Trader
+/plugin install ark-trader@ark-trader
+```
+
+設定與資料仍在 `~/.ark-toolkit/`（帳戶、憑證、決策日誌），路徑不變，重裝後直接沿用。
 
 ## 前置需求
 
@@ -81,11 +96,11 @@ codex plugin marketplace upgrade Ark-Trader    # Codex
 初次使用兩步：`ark-setup` 設定帳戶 > `ark-start` 驗證（模擬單通過後自動接實際看單）。
 
 ```bash
-uv run plugins/ark-toolkit/skills/ark-setup/setup.py             # 帳戶清單設定
-uv run plugins/ark-toolkit/skills/ark-start/verify.py            # 模擬單驗證（不碰真錢）
-uv run plugins/ark-toolkit/skills/ark-read/read.py               # 靜默看各帳戶持倉
-uv run plugins/ark-toolkit/skills/ark-sync/sync.py --dry-run     # 看 ARK 與真實持倉的差異
-uv run plugins/ark-toolkit/skills/ark-analyze/analyze.py         # 看風險
+uv run plugins/ark-trader/skills/ark-setup/setup.py             # 帳戶清單設定
+uv run plugins/ark-trader/skills/ark-start/verify.py            # 模擬單驗證（不碰真錢）
+uv run plugins/ark-trader/skills/ark-read/read.py               # 靜默看各帳戶持倉
+uv run plugins/ark-trader/skills/ark-sync/sync.py --dry-run     # 看 ARK 與真實持倉的差異
+uv run plugins/ark-trader/skills/ark-analyze/analyze.py         # 看風險
 ```
 
 ### 寫入後端切換
@@ -93,8 +108,8 @@ uv run plugins/ark-toolkit/skills/ark-analyze/analyze.py         # 看風險
 ark-sync 寫入預設走 AX（有 App「總成本」見證）。切換到 API 寫入：
 
 ```bash
-ARK_API_WRITES=1 uv run plugins/ark-toolkit/skills/ark-sync/sync.py --dry-run   # 先 dry-run 確認
-ARK_API_WRITES=1 uv run plugins/ark-toolkit/skills/ark-sync/sync.py             # 實際執行
+ARK_API_WRITES=1 uv run plugins/ark-trader/skills/ark-sync/sync.py --dry-run   # 先 dry-run 確認
+ARK_API_WRITES=1 uv run plugins/ark-trader/skills/ark-sync/sync.py             # 實際執行
 ```
 
 API 寫入每筆帶 read-after-write 驗證（寫入後讀回比對最終狀態），取代 AX 的「總成本」見證。
@@ -115,16 +130,16 @@ python3 ark_capture.py down      # 關閉攔截、移除 CA
 純邏輯測試不需要 ARK 執行中，任何平台皆可跑：
 
 ```bash
-cd plugins/ark-toolkit/lib                && uv run --no-project --python 3.13 --with openpyxl python -m unittest test_source test_dialogs test_arkapi
-cd plugins/ark-toolkit/lib                && uv run --no-project --python 3.13 --with pyobjc-framework-cocoa --with pyobjc-framework-applicationservices --with pyobjc-framework-quartz python -m unittest test_ax
-cd plugins/ark-toolkit/skills/ark-collect && PYTHONPATH=../../lib uv run --no-project --python 3.13 --with openpyxl --with python-dotenv python -m unittest test_collect
-cd plugins/ark-toolkit/skills/ark-read    && PYTHONPATH=../../lib uv run --no-project --python 3.13 --with openpyxl --with python-dotenv python -m unittest test_read
-cd plugins/ark-toolkit/skills/ark-sync    && PYTHONPATH=../../lib uv run --no-project --python 3.13 python -m unittest test_sync
-cd plugins/ark-toolkit/skills/ark-analyze && PYTHONPATH=../../lib uv run --no-project --python 3.13 python -m unittest test_analyze
-cd plugins/ark-toolkit/skills/ark-explore && PYTHONPATH=../../lib uv run --no-project --python 3.13 python -m unittest test_explore
-cd plugins/ark-toolkit/skills/ark-setup   && PYTHONPATH=../../lib uv run --no-project --python 3.13 --with openpyxl --with python-dotenv python -m unittest test_setup
-cd plugins/ark-toolkit/skills/ark-agent   && PYTHONPATH=../../lib uv run --no-project --python 3.13 python -m unittest test_market test_packet test_journal test_evaluate test_risk test_tracks test_equity test_execute test_daily test_phase0 test_review test_dividends test_gates
-cd plugins/ark-toolkit/skills/ark-agent   && PYTHONPATH=../../lib uv run --no-project --python 3.13 --with pyobjc-framework-cocoa --with pyobjc-framework-applicationservices --with pyobjc-framework-quartz python -m unittest test_record_return
+cd plugins/ark-trader/lib                && uv run --no-project --python 3.13 --with openpyxl python -m unittest test_source test_dialogs test_arkapi
+cd plugins/ark-trader/lib                && uv run --no-project --python 3.13 --with pyobjc-framework-cocoa --with pyobjc-framework-applicationservices --with pyobjc-framework-quartz python -m unittest test_ax
+cd plugins/ark-trader/skills/ark-collect && PYTHONPATH=../../lib uv run --no-project --python 3.13 --with openpyxl --with python-dotenv python -m unittest test_collect
+cd plugins/ark-trader/skills/ark-read    && PYTHONPATH=../../lib uv run --no-project --python 3.13 --with openpyxl --with python-dotenv python -m unittest test_read
+cd plugins/ark-trader/skills/ark-sync    && PYTHONPATH=../../lib uv run --no-project --python 3.13 python -m unittest test_sync
+cd plugins/ark-trader/skills/ark-analyze && PYTHONPATH=../../lib uv run --no-project --python 3.13 python -m unittest test_analyze
+cd plugins/ark-trader/skills/ark-explore && PYTHONPATH=../../lib uv run --no-project --python 3.13 python -m unittest test_explore
+cd plugins/ark-trader/skills/ark-setup   && PYTHONPATH=../../lib uv run --no-project --python 3.13 --with openpyxl --with python-dotenv python -m unittest test_setup
+cd plugins/ark-trader/skills/ark-agent   && PYTHONPATH=../../lib uv run --no-project --python 3.13 python -m unittest test_market test_packet test_journal test_evaluate test_risk test_tracks test_equity test_execute test_daily test_phase0 test_review test_dividends test_gates
+cd plugins/ark-trader/skills/ark-agent   && PYTHONPATH=../../lib uv run --no-project --python 3.13 --with pyobjc-framework-cocoa --with pyobjc-framework-applicationservices --with pyobjc-framework-quartz python -m unittest test_record_return
 ```
 
 ## 通用性原則（給使用本 plugin 的 coding agent）
