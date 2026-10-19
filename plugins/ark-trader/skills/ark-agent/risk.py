@@ -235,13 +235,16 @@ def _is_str_list(v):
 
 
 def _holding_row(h):
-    """持股列算「讀到位階」的條件：是物件、`suggest_qty` 是整數（位階與建議調節是
-    同一組可選欄位）、`tiers` 是字串清單。缺欄、None 或型別不對都是沒讀到，
-    不可退化成空清單——那會把未知誤判成確認無燈號。"""
+    """持股列算「讀到位階」的條件：是物件、`tiers` 是字串清單。缺欄、None 或型別不對
+    都是沒讀到，不可退化成空清單——那會把未知誤判成確認無燈號。
+
+    建議調節欄（`suggest_qty`）不參與判讀：它只在運算頁為調節態（實際持股比高於建議）
+    時出現，buy 日整欄消失；位階欄是獨立的一欄，buy 日照樣在。曾以 `suggest_qty`
+    為前提，結果 buy 日整個個股桶都被判成未知。"""
     if not isinstance(h, dict):
         return None
-    qty, tiers = h.get("suggest_qty"), h.get("tiers")
-    if not isinstance(qty, int) or isinstance(qty, bool) or not _is_str_list(tiers):
+    tiers = h.get("tiers")
+    if not _is_str_list(tiers):
         return None
     return {"tiers": list(tiers)}
 
@@ -255,10 +258,9 @@ def lamp_state(code, holdings, industry):
     """持股的 ARK 燈號（價值／升溫），附來源，供個股桶出場判準使用。
 
     兩個獨立來源：調節庫存列的位階欄（AX），與產業價值區／升溫區名單（API）。
-    位階欄與建議調節欄是同一組可選欄位（App 未算出建議時整組消失），所以
-    `suggest_qty` 為 None 的列不算「讀到位階」。名單讀取失敗或沒保存
-    （舊決策包沒有 `heating_codes`）也是未知。來源互相矛盾時以亮燈者為準，
-    絕不因此判成無燈號。
+    位階欄缺失或型別不對的列不算「讀到位階」（建議調節欄只在調節態出現，與位階
+    無關，見 `_holding_row`）。名單讀取失敗或沒保存（舊決策包沒有 `heating_codes`）
+    也是未知。來源互相矛盾時以亮燈者為準，絕不因此判成無燈號。
     """
     row = _holding_row((holdings or {}).get(code))
     ind = industry if isinstance(industry, dict) else {}
