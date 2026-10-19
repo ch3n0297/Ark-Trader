@@ -620,9 +620,10 @@ class TestLampState(unittest.TestCase):
     def test_持股列沒讀到_未知(self):
         self.assertEqual(self.state("2383", {})["state"], risk.LAMP_UNKNOWN)
 
-    def test_位階與建議調節整組缺失_未知(self):
+    def test_建議調節缺失_位階仍算讀到(self):
+        # buy 日 App 不顯示建議調節欄（suggest_qty 為 None），位階欄照樣存在
         s = self.state("2383", {"2383": lamp_row([], suggest_qty=None)})
-        self.assertEqual(s["state"], risk.LAMP_UNKNOWN)
+        self.assertEqual(s["state"], risk.LAMP_NONE)
 
     def test_10月8日川湖的舊決策包_升溫名單未存_未知(self):
         old = {"source": "api/st/10", "candidates": {}, "sectors": {}, "error": None}
@@ -690,7 +691,8 @@ class TestLampExitScopeFromEnv(unittest.TestCase):
 
 class TestLampStateMalformedRow(unittest.TestCase):
     """持股列的位階欄缺失或型別不對＝沒讀到，不是空燈號。兩份名單完整且都不含它時，
-    只有 tiers=[]（真的讀到、真的沒字樣）才能當確認無燈號的證據。"""
+    只有 tiers=[]（真的讀到、真的沒字樣）才能當確認無燈號的證據。
+    建議調節欄與位階欄是獨立的兩欄（前者只在調節態出現），不參與判讀。"""
 
     def state(self, holding):
         return risk.lamp_state("2383", {"2383": holding}, LAMP_INDUSTRY)["state"]
@@ -709,10 +711,10 @@ class TestLampStateMalformedRow(unittest.TestCase):
             with self.subTest(tiers=bad):
                 self.assertEqual(self.state({"tiers": bad, "suggest_qty": 0}), risk.LAMP_UNKNOWN)
 
-    def test_suggest_qty型別不對_未知(self):
-        for bad in ("0", 0.5, True, [0]):
+    def test_suggest_qty不影響位階判讀(self):
+        for bad in ("0", 0.5, True, [0], None):
             with self.subTest(suggest_qty=bad):
-                self.assertEqual(self.state({"tiers": [], "suggest_qty": bad}), risk.LAMP_UNKNOWN)
+                self.assertEqual(self.state({"tiers": [], "suggest_qty": bad}), risk.LAMP_NONE)
 
     def test_持股列本身不是物件_未知(self):
         for bad in (None, [], "2383"):
