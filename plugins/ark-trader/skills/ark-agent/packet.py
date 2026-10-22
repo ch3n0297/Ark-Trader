@@ -367,6 +367,15 @@ def run_sync():
     return done.returncode == 0
 
 
+def sync_and_reread(ax, sync=run_sync, read=read_ark):
+    """同步後重讀 ARK。sync 走 API 寫入時會重啟 App 讓畫面跟上，舊 pid 隨之
+    失效——沿用它重讀會拋 ArkNotRunning（2026-10-22 整天沒有決策），所以重讀
+    前重新取得 pid。不論同步回報成功與否都要重讀：動過寫入，手上的資料就過期了。"""
+    sync()
+    pid = ark.ensure_responsive(ax, ax.ensure_ready())
+    return pid, read(ax, pid)
+
+
 def main():
     ap = argparse.ArgumentParser(description="產生 ark-agent 的盤前決策包")
     ap.add_argument("--date", help="覆寫決策日（預設今天；僅供測試或補跑）")
@@ -448,9 +457,7 @@ def main():
         if diff and not args.no_sync:
             print(f"⚠️ {len(diff)} 檔與券商不一致：{', '.join(diff)}　→ 自動同步中…\n",
                   flush=True)
-            run_sync()
-            # 不論同步回報成功與否都要重讀——動過寫入，手上的資料就過期了
-            holdings, declared, posture = read_ark(ax, pid)
+            pid, (holdings, declared, posture) = sync_and_reread(ax)
             positions = broker_positions(api, basis)
             diff = positions_diff(holdings, positions)
             sync_ok = not diff

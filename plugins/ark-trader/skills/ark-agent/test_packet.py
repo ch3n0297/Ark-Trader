@@ -414,3 +414,28 @@ class TestMarketOpen(unittest.TestCase):
 
     def test_完全沒有資料視為未開盤(self):
         self.assertFalse(packet.market_open("2026-10-12", [], None))
+
+
+class TestSyncAndReread(unittest.TestCase):
+    """2026-10-22：自動同步走 API 寫入後會重啟 App，pid 換新；
+    packet 拿舊 pid 重讀 → ArkNotRunning，整天沒有決策。"""
+
+    def test_同步重啟App後以新pid重讀(self):
+        calls = []
+        fake_ax = SimpleNamespace(ensure_ready=lambda: 222)
+        read = lambda ax, pid: calls.append(pid) or ("holdings", "declared", "posture")
+        with unittest.mock.patch.object(packet.ark, "ensure_responsive",
+                                        side_effect=lambda ax, pid: pid):
+            pid, result = packet.sync_and_reread(fake_ax, sync=lambda: True, read=read)
+        self.assertEqual(pid, 222)
+        self.assertEqual(calls, [222])
+        self.assertEqual(result, ("holdings", "declared", "posture"))
+
+    def test_先同步再取pid(self):
+        order = []
+        fake_ax = SimpleNamespace(ensure_ready=lambda: order.append("ready") or 222)
+        with unittest.mock.patch.object(packet.ark, "ensure_responsive",
+                                        side_effect=lambda ax, pid: pid):
+            packet.sync_and_reread(fake_ax, sync=lambda: order.append("sync"),
+                                   read=lambda ax, pid: None)
+        self.assertEqual(order, ["sync", "ready"])
