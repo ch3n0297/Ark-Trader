@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 480" width="900" height="480" role="img" aria-label="ark-trader 運作流程：10:00 決策、14:30 結算、週五 15:00 複盤">
+  <style>
+    .bg { fill: #ffffff; }
+    .lane { fill: #f3f5f8; }
+    .box { fill: #ffffff; stroke: #c3cbd8; stroke-width: 1.2; }
+    .model { fill: #e2eafb; stroke: #2456b8; stroke-width: 1.6; }
+    .t { font: 600 15px "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", sans-serif; fill: #18202e; }
+    .s { font: 12px "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", sans-serif; fill: #5b6577; }
+    .h { font: 700 16px "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", sans-serif; fill: #2456b8; }
+    .a { stroke: #8a94a6; stroke-width: 1.6; fill: none; }
+    .fb { stroke: #2456b8; stroke-width: 1.6; fill: none; stroke-dasharray: 6 5; }
+    .ah { fill: #8a94a6; }
+    .ahb { fill: #2456b8; }
+    .note { font: 13px "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", sans-serif; fill: #5b6577; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #0d1117; }
+      .lane { fill: #161b22; }
+      .box { fill: #0d1117; stroke: #3a4556; }
+      .model { fill: #1c2a47; stroke: #7ea6ff; }
+      .t { fill: #e6eaf2; }
+      .s, .note { fill: #9aa5b8; }
+      .h { fill: #7ea6ff; }
+      .a { stroke: #6b7689; } .ah { fill: #6b7689; }
+      .fb { stroke: #7ea6ff; } .ahb { fill: #7ea6ff; }
+    }
+  </style>
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah" d="M0,0 L10,5 L0,10 z"/></marker>
+    <marker id="arrb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ahb" d="M0,0 L10,5 L0,10 z"/></marker>
+  </defs>
+  <rect class="bg" x="0" y="0" width="900" height="480" rx="12"/>
+
+  <!-- 三條泳道 -->
+  <rect class="lane" x="12" y="12" width="286" height="412" rx="10"/>
+  <rect class="lane" x="307" y="12" width="286" height="270" rx="10"/>
+  <rect class="lane" x="602" y="12" width="286" height="270" rx="10"/>
+  <text class="h" x="32" y="42">每個交易日 10:00　決策</text>
+  <text class="h" x="327" y="42">14:30　結算</text>
+  <text class="h" x="622" y="42">週五 15:00　複盤</text>
+
+  <!-- 決策 -->
+  <rect class="box" x="32" y="60" width="246" height="56" rx="8"/>
+  <text class="t" x="48" y="84">蒐集事實</text><text class="s" x="48" y="104">App 讀數＋券商持倉，對不上先同步</text>
+  <rect class="box" x="32" y="134" width="246" height="56" rx="8"/>
+  <text class="t" x="48" y="158">畫出邊界</text><text class="s" x="48" y="178">熔斷等級、配額、停損</text>
+  <rect class="model" x="32" y="208" width="246" height="56" rx="8"/>
+  <text class="t" x="48" y="232">模型做決策</text><text class="s" x="48" y="252">claude 或 codex，只交出決策 JSON</text>
+  <rect class="box" x="32" y="282" width="246" height="56" rx="8"/>
+  <text class="t" x="48" y="306">紀律驗證並鎖定</text><text class="s" x="48" y="326">違規就拒收；同日只認第一筆</text>
+  <rect class="box" x="32" y="356" width="246" height="56" rx="8"/>
+  <text class="t" x="48" y="380">送出委託</text><text class="s" x="48" y="400">零股限價單（永豐 Shioaji）</text>
+  <path class="a" d="M155,116 V132" marker-end="url(#arr)"/>
+  <path class="a" d="M155,190 V206" marker-end="url(#arr)"/>
+  <path class="a" d="M155,264 V280" marker-end="url(#arr)"/>
+  <path class="a" d="M155,338 V354" marker-end="url(#arr)"/>
+
+  <!-- 結算 -->
+  <rect class="box" x="327" y="60" width="246" height="56" rx="8"/>
+  <text class="t" x="343" y="84">成交對回</text><text class="s" x="343" y="104">記成交價、滑價與沒成交的單</text>
+  <rect class="box" x="327" y="134" width="246" height="56" rx="8"/>
+  <text class="t" x="343" y="158">淨值與熔斷</text><text class="s" x="343" y="178">回撤 −8% 停買，−15% 停機</text>
+  <rect class="box" x="327" y="208" width="246" height="56" rx="8"/>
+  <text class="t" x="343" y="232">同步回 App</text><text class="s" x="343" y="252">庫存與現金寫回並讀回驗證</text>
+  <path class="a" d="M450,116 V132" marker-end="url(#arr)"/>
+  <path class="a" d="M450,190 V206" marker-end="url(#arr)"/>
+
+  <!-- 複盤 -->
+  <rect class="model" x="622" y="60" width="246" height="56" rx="8"/>
+  <text class="t" x="638" y="84">檢討本週決策</text><text class="s" x="638" y="104">對照之後的實際報酬與 0050</text>
+  <rect class="model" x="622" y="134" width="246" height="56" rx="8"/>
+  <text class="t" x="638" y="158">修改準則檔</text><text class="s" x="638" y="178">閘門只能在硬區間內小步調整</text>
+  <rect class="box" x="622" y="208" width="246" height="56" rx="8"/>
+  <text class="t" x="638" y="232">驗證後 commit</text><text class="s" x="638" y="252">準則一條不少，壞了就還原</text>
+  <path class="a" d="M745,116 V132" marker-end="url(#arr)"/>
+  <path class="a" d="M745,190 V206" marker-end="url(#arr)"/>
+
+  <!-- 回饋：新準則給下週決策 -->
+  <path class="fb" d="M745,264 V320 H300 V236 H282" marker-end="url(#arrb)"/>
+  <text class="s" x="440" y="342">下週的決策讀新版準則</text>
+
+  <!-- 圖例與註記 -->
+  <rect class="model" x="327" y="374" width="18" height="14" rx="3"/>
+  <text class="note" x="352" y="386">模型負責的步驟；其餘都是寫死的程式</text>
+  <text class="note" x="327" y="410">任一步檢查不過，當天就不交易並記下原因。</text>
+  <text class="note" x="12" y="456">下單只在兩種情況發生：launchd 排程觸發，或你自己在終端機執行 daily.py trade。</text>
+</svg>
