@@ -3,7 +3,7 @@
 本檔記錄 ark-trader（原名 ark-toolkit）的版本沿革。版本語意：主版號＝正式里程碑，
 次版號＝行為或語意變更，修訂號＝bug 修正。
 
-## [Unreleased]
+## [2.1.0] - 2026-10-26
 
 - **決策層 CLI 改用視窗選擇**：`install.sh` 新增第 6 步，agent.env 還沒設 `ARK_DECISION_CLI` 時跳出 macOS 原生視窗（osascript）選 claude／codex 與模型，只列出已安裝的 CLI，按取消不改檔；`install.sh decision` 隨時重選。新增 `choose_cli.py`／`test_choose_cli.py`。
 - **改名：plugin 與 marketplace 統一為 `ark-trader`**（原 plugin `ark-toolkit`、marketplace
@@ -39,6 +39,8 @@
   找對應的 CLI 並帶進 launchd PATH；週複盤要改準則檔，固定走 claude（codex 模式下用 `fable`）。
   不認得的 `ARK_DECISION_CLI` 在任何一步之前擋下。`ARK_DECISION_MODEL` 設為空字串時改視同未設
   （過去會帶 `--model ""`）。
+- **修正：ark-agent packet 自動同步後沿用舊的 App pid**。對帳不一致時 packet 呼叫 ark-sync，API 寫入後 sync 會重啟 App 讓畫面跟上，pid 隨之換新；packet 仍拿舊 pid 重讀，拋 `ArkNotRunning`（「讀不到 ARK 視窗」），當天沒有決策。改由 `sync_and_reread` 同步後重新取得 pid 再讀。
+- **修正：risk 持股列只以位階欄判讀燈號**。`_holding_row` 原本以建議調節欄為前提，該欄只在調節態出現，buy 日整個個股桶被判成 `unknown`。
 
 ## [2.0.1] - 2026-10-14
 
