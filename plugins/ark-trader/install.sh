@@ -2,10 +2,11 @@
 # ark-trader 安裝與排程（僅限 macOS）。流程寫死在這裡，每台機器跑出來的結果一致；
 # 由使用者在終端機執行，不交給 coding agent 自行判斷步驟。
 #
-#   bash install.sh [--skip-setup]       安裝：macOS → uv → 預熱依賴 → 輔助使用權限 → ark-setup
+#   bash install.sh [--skip-setup]       安裝：macOS → uv → 預熱依賴 → 輔助使用權限 → ark-setup → 決策層 CLI
 #   bash install.sh schedule [--live] [--jobs decide,settle] [--dry-run]
 #                                        依這台機器產生並載入 launchd 排程（預設 simulation）
 #   bash install.sh unschedule           卸載並刪除排程
+#   bash install.sh decision             跳出視窗重選決策層 CLI 與模型（claude／codex）
 #
 # plugin 更新後重跑一次 `bash install.sh`：~/.ark-toolkit/plugin 連結會指向新位置，
 # 排程經由這個連結呼叫腳本，不必重新產生。
@@ -21,7 +22,7 @@ step() { printf '\n▶ %s\n' "$*"; }
 die()  { printf '🛑 %s\n' "$*" >&2; exit 1; }
 
 usage() {
-  sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -119,26 +120,30 @@ cmd_install() {
     shift
   done
 
-  step "1/5 檢查系統"
+  step "1/6 檢查系統"
   require_macos
   say "✅ macOS $(sw_vers -productVersion 2>/dev/null || true)（$(uname -m)）"
 
-  step "2/5 uv"
+  step "2/6 uv"
   ensure_uv
   link_plugin
 
-  step "3/5 預熱 Python 與套件（第一次較久）"
+  step "3/6 預熱 Python 與套件（第一次較久）"
   prewarm
 
-  step "4/5 輔助使用權限"
+  step "4/6 輔助使用權限"
   ensure_ax
 
-  step "5/5 帳戶設定（ark-setup）"
+  step "5/6 帳戶設定（ark-setup）"
   if [ "$skip_setup" = 1 ]; then
     say "已略過（--skip-setup）；之後可執行：\"$UV\" run \"$ROOT/skills/ark-setup/setup.py\""
   else
     "$UV" run "$ROOT/skills/ark-setup/setup.py" || die "ark-setup 未完成；修正後重跑本腳本"
   fi
+
+  step "6/6 決策層 CLI"
+  # 已設定就沿用，不打擾；按取消也不擋安裝（未設定＝claude／fable）
+  "$UV" run --quiet "$ROOT/skills/ark-agent/choose_cli.py" --if-missing || true
 
   step "完成"
   say "下一步："
@@ -157,6 +162,12 @@ cmd_schedule() {
   "$UV" run --quiet "$ROOT/skills/ark-agent/schedule.py" install --uv "$UV" --plugin-dir "$LINK" ${1+"$@"}
 }
 
+cmd_decision() {
+  require_macos
+  ensure_uv
+  "$UV" run --quiet "$ROOT/skills/ark-agent/choose_cli.py"
+}
+
 cmd_unschedule() {
   require_macos
   ensure_uv
@@ -167,6 +178,7 @@ case "${1:-install}" in
   install)    [ $# -gt 0 ] && shift; cmd_install ${1+"$@"} ;;
   schedule)   shift; cmd_schedule ${1+"$@"} ;;
   unschedule) shift; cmd_unschedule ;;
+  decision)   shift; cmd_decision ;;
   -h|--help|help) usage 0 ;;
   --*)        cmd_install ${1+"$@"} ;;
   *)          say "未知指令：$1"; usage 1 ;;
