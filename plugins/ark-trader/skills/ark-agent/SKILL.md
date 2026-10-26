@@ -204,6 +204,7 @@ ARK_DECISION_CLI=codex
 # ARK_DECISION_MODEL=<codex 的模型名>   # 不設就用 Codex 預設
 ```
 
+- **用視窗選**：`install.sh` 初次安裝的第 6 步會跳出 macOS 視窗選 CLI 與模型（claude：fable／opus；codex：gpt-6-astra／Codex 預設），寫進 agent.env；已設定就不打擾。之後要換執行 `bash "${CLAUDE_PLUGIN_ROOT}/install.sh" decision`（交給使用者在終端機跑）。推理強度不在視窗選，codex 固定 xhigh
 - `--ignore-user-config`：不讀 `$CODEX_HOME/config.toml`，排程結果不隨個人設定漂移
   （登入仍沿用 `CODEX_HOME` 的憑證，排程前先在終端機登入 codex）。個人設定裡的沙箱、
   核准、模型與推理強度都不會帶進來
@@ -335,7 +336,7 @@ evaluate 只輸出點估計＋樣本數＋pending 筆數；60 日前瞻報酬要
 測試（純邏輯，不需要 ARK 或 Shioaji，任何平台可跑）：
 
 ```bash
-cd skills/ark-agent && PYTHONPATH=../../lib uv run --no-project --python 3.13 python -m unittest test_market test_packet test_journal test_evaluate test_risk test_tracks test_equity test_execute test_daily test_phase0 test_gates test_review test_schedule -v
+cd skills/ark-agent && PYTHONPATH=../../lib uv run --no-project --python 3.13 python -m unittest test_market test_packet test_journal test_evaluate test_risk test_tracks test_equity test_execute test_daily test_phase0 test_gates test_review test_schedule test_choose_cli -v
 ```
 
 ## 前置需求

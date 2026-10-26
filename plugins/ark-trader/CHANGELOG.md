@@ -5,6 +5,7 @@
 
 ## [Unreleased]
 
+- **決策層 CLI 改用視窗選擇**：`install.sh` 新增第 6 步，agent.env 還沒設 `ARK_DECISION_CLI` 時跳出 macOS 原生視窗（osascript）選 claude／codex 與模型，只列出已安裝的 CLI，按取消不改檔；`install.sh decision` 隨時重選。新增 `choose_cli.py`／`test_choose_cli.py`。
 - **改名：plugin 與 marketplace 統一為 `ark-trader`**（原 plugin `ark-toolkit`、marketplace
   `ark-tools`），與 GitHub repo `Ark-Trader` 一致。安裝指令改為
   `/plugin install ark-trader@ark-trader`；舊 README 寫的 `ark-toolkit@Ark-Trader` 拿 repo
