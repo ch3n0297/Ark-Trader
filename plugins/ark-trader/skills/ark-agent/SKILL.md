@@ -204,8 +204,10 @@ ARK_DECISION_CLI=codex
 # ARK_DECISION_MODEL=<codex 的模型名>   # 不設就用 Codex 預設
 ```
 
-- **claude 改走 API Key**：把 Key 存進 Keychain（`security add-generic-password -a "$USER" -s ark-agent-anthropic -w`，
-  由使用者在終端機輸入），agent.env 設 `ARK_ANTHROPIC_KEYCHAIN=ark-agent-anthropic` 後重跑 `schedule`。
+- **claude 改走 API Key**：`install.sh` 初次安裝第 7 步跳視窗選「訂閱／API Key」；之後要換執行
+  `bash "${CLAUDE_PLUGIN_ROOT}/install.sh" apikey`（交給使用者在終端機跑，Key 由使用者自己輸入）。
+  Key 存在 Keychain 服務 `ark-agent-anthropic`，agent.env 只寫 `ARK_ANTHROPIC_KEYCHAIN=ark-agent-anthropic`
+  （空值＝選了訂閱）。寫入前先用 haiku 驗一次（約 $0.001），失敗不改檔。已裝排程要重跑 `schedule`。
   每次呼叫 claude（決策與複盤）前才讀，只放進該子程序的 `ANTHROPIC_API_KEY`；讀不到就當場停，
   不退回訂閱。`check` 會驗讀得到。未設＝沿用 CLI 登入
 - **用視窗選**：`install.sh` 初次安裝的第 6 步會跳出 macOS 視窗選 CLI 與模型（claude：fable／opus；codex：gpt-6-astra／Codex 預設），寫進 agent.env；已設定就不打擾。之後要換執行 `bash "${CLAUDE_PLUGIN_ROOT}/install.sh" decision`（交給使用者在終端機跑）。推理強度不在視窗選，codex 固定 xhigh
