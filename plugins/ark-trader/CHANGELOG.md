@@ -3,6 +3,18 @@
 本檔記錄 ark-trader（原名 ark-toolkit）的版本沿革。版本語意：主版號＝正式里程碑，
 次版號＝行為或語意變更，修訂號＝bug 修正。
 
+## [2.2.0] - 2026-11-01
+
+- **claude -p 可改走 API Key 計費**：`install.sh` 新增第 7 步，跳 macOS 視窗選「訂閱／API Key」；
+  `install.sh apikey` 隨時重選。Key 由使用者在終端機輸入、只存在 Keychain（服務 `ark-agent-anthropic`），
+  agent.env 只寫 `ARK_ANTHROPIC_KEYCHAIN`（空值＝訂閱）。寫入前用乾淨環境跑一次 haiku 驗證（約 $0.001），
+  失敗不改檔。`daily.py` 每次呼叫 claude（決策與複盤）前才讀 Key、只注入該子程序；讀不到就停，不退回訂閱；
+  `check` 會驗讀得到。新增 `choose_auth.py`／`test_choose_auth.py`。
+- **claude -p 不再讀個人設定**：加上 `--setting-sources project`、`--strict-mcp-config`、
+  `--disable-slash-commands`，不載入 `~/.claude` 的 plugins／hooks／MCP／skills／CLAUDE.md；
+  `--tools` 限定工具組，Bash 等工具從「沒放行」變成「不存在」。實測 fable 每次固定開銷 $0.47→$0.21。
+  不用 `--bare`：實測它開不出 WebSearch／Write。
+
 ## [2.1.0] - 2026-10-26
 
 - **決策層 CLI 改用視窗選擇**：`install.sh` 新增第 6 步，agent.env 還沒設 `ARK_DECISION_CLI` 時跳出 macOS 原生視窗（osascript）選 claude／codex 與模型，只列出已安裝的 CLI，按取消不改檔；`install.sh decision` 隨時重選。新增 `choose_cli.py`／`test_choose_cli.py`。
