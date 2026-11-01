@@ -93,6 +93,10 @@ DECISION_CLI, DECISION_MODEL, REVIEW_MODEL = model_settings(os.environ)
 # 只用在 claude：額度判斷認的是 claude CLI 的訊息（見 is_quota_exhausted）。
 FALLBACK_MODEL = os.environ.get("ARK_DECISION_FALLBACK", "opus")
 
+# claude -p 改走 API Key 計費：值是 macOS Keychain 的服務名（不是 Key 本身），
+# 呼叫前才讀、只放進 claude 子程序的環境。未設＝沿用 CLI 的登入（訂閱）。
+API_KEY_KEYCHAIN = os.environ.get("ARK_ANTHROPIC_KEYCHAIN", "").strip()
+
 
 # ---------------------------------------------------------------- 純邏輯
 
@@ -397,6 +401,27 @@ DECIDE_TOOLS = ("Read", "Write", "WebSearch", "WebFetch")
 REVIEW_TOOLS = ("Read", "Write", "Edit")       # 改準則檔要 Edit；複盤不上網
 
 
+def read_keychain(service):
+    """Keychain 取 generic password；讀不到或為空就 RuntimeError（訊息不含 Key）。"""
+    done = subprocess.run(["security", "find-generic-password", "-s", service, "-w"],
+                          capture_output=True, text=True, check=False)
+    key = done.stdout.strip()
+    if done.returncode != 0 or not key:
+        raise RuntimeError(f"Keychain 讀不到 {service!r}（{done.stderr.strip() or '項目為空'}）")
+    return key
+
+
+def model_env(cli, service, env, read_key=read_keychain):
+    """claude 且有設 Keychain 服務名 → 帶 ANTHROPIC_API_KEY 的新環境；否則 None（繼承）。
+
+    codex 不吃 Anthropic 的 Key，不帶。讀不到時讓例外往上拋——寧可當天不跑，
+    也不默默退回訂閱。
+    """
+    if cli != CLAUDE or not service:
+        return None
+    return {**env, "ANTHROPIC_API_KEY": read_key(service)}
+
+
 def ask_model(mode, prompt, model, tools=DECIDE_TOOLS, cwd=STATE, cli=CLAUDE):
     """LLM 插槽：只給讀檔／寫檔／查新聞，**不給 Bash**——它無法自行送單或改紀錄
     （codex 則是唯讀沙箱，見 model_command）。回傳 (離開碼, 輸出)，輸出同時進 daily.log。
@@ -409,13 +434,18 @@ def ask_model(mode, prompt, model, tools=DECIDE_TOOLS, cwd=STATE, cli=CLAUDE):
     （把內容附加到提示後），繼承到一條不會關的 pipe／socket 就永遠卡住。
     """
     cmd = model_command(cli, prompt, model, tools)
-    log(mode, f"呼叫 {cli}（{model or '預設模型'}）…")
+    try:
+        env = model_env(cli, API_KEY_KEYCHAIN, os.environ, read_key=read_keychain)
+    except RuntimeError as exc:
+        notify(mode, f"🛑 {exc}，未呼叫 {cli}")
+        return 1, ""
+    log(mode, f"呼叫 {cli}（{model or '預設模型'}{'，API Key' if env else ''}）…")
     split = cli == CODEX
     try:
         proc = subprocess.run(
             cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE if split else subprocess.STDOUT,
-            text=True, cwd=cwd, check=False)
+            text=True, cwd=cwd, env=env, check=False)
     except FileNotFoundError:
         log(mode, f"🛑 找不到 {cli} CLI")
         return 127, ""
@@ -715,6 +745,11 @@ def check(backend):
     for name in optional:
         if not has_cli(name):
             log(mode, f"⚠️ 找不到 {name}：決策層不受影響，但週複盤（review）仍需 {name}")
+    if API_KEY_KEYCHAIN:
+        try:
+            read_keychain(API_KEY_KEYCHAIN)
+        except RuntimeError as exc:
+            bad.append(str(exc))
     if run(mode, os.path.join(HERE, "preflight.py")) != 0:
         bad.append("preflight 未過（詳見 daily.log）")
     if bad:

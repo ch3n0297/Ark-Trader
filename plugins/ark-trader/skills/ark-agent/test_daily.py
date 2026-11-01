@@ -765,3 +765,65 @@ class TestAskModelProcess(unittest.TestCase):
         with mock.patch.object(daily.subprocess, "run", side_effect=FileNotFoundError), \
              mock.patch.object(daily, "log", lambda *a, **k: None):
             self.assertEqual(daily.ask_model("decide", "提示", None, cli="codex"), (127, ""))
+
+
+class TestKeychainApiKey(unittest.TestCase):
+    """ARK_ANTHROPIC_KEYCHAIN：claude -p 改走 API Key，Key 從 Keychain 讀、只給子程序"""
+
+    def test_未設定就繼承環境(self):
+        self.assertIsNone(daily.model_env("claude", "", {"A": "1"}, read_key=None))
+
+    def test_codex不帶Key(self):
+        self.assertIsNone(daily.model_env("codex", "svc", {"A": "1"},
+                                          read_key=lambda s: "sk-x"))
+
+    def test_有設定就注入Key且不動原環境(self):
+        base = {"A": "1"}
+        env = daily.model_env("claude", "svc", base, read_key=lambda s: f"key-of-{s}")
+        self.assertEqual(env, {"A": "1", "ANTHROPIC_API_KEY": "key-of-svc"})
+        self.assertNotIn("ANTHROPIC_API_KEY", base)
+
+    def test_讀Keychain失敗就報錯(self):
+        done = mock.Mock(returncode=44, stdout="", stderr="could not be found")
+        with mock.patch.object(daily.subprocess, "run", return_value=done):
+            with self.assertRaises(RuntimeError):
+                daily.read_keychain("svc")
+
+    def test_Keychain項目為空也算失敗(self):
+        done = mock.Mock(returncode=0, stdout="\n", stderr="")
+        with mock.patch.object(daily.subprocess, "run", return_value=done):
+            with self.assertRaises(RuntimeError):
+                daily.read_keychain("svc")
+
+    def test_ask_model把Key交給claude子程序(self):
+        proc = mock.Mock(returncode=0, stdout="ok", stderr="")
+        with mock.patch.object(daily, "API_KEY_KEYCHAIN", "svc"), \
+             mock.patch.object(daily, "read_keychain", return_value="sk-test"), \
+             mock.patch.object(daily.subprocess, "run", return_value=proc) as run, \
+             mock.patch.object(daily, "log", lambda *a, **k: None):
+            daily.ask_model("decide", "提示", "fable")
+        self.assertEqual(run.call_args.kwargs["env"]["ANTHROPIC_API_KEY"], "sk-test")
+
+    def test_ask_model讀不到Key就不呼叫claude也不退回訂閱(self):
+        notes = []
+        with mock.patch.object(daily, "API_KEY_KEYCHAIN", "svc"), \
+             mock.patch.object(daily, "read_keychain", side_effect=RuntimeError("Keychain 讀不到 'svc'")), \
+             mock.patch.object(daily.subprocess, "run") as run, \
+             mock.patch.object(daily, "notify", lambda mode, msg: notes.append(msg)), \
+             mock.patch.object(daily, "log", lambda *a, **k: None):
+            rc, out = daily.ask_model("decide", "提示", "fable")
+        self.assertNotEqual(rc, 0)
+        run.assert_not_called()
+        self.assertIn("Keychain", notes[-1])
+
+    def test_前置檢查會驗Keychain讀得到(self):
+        notes = []
+        with mock.patch.object(daily, "API_KEY_KEYCHAIN", "svc"), \
+             mock.patch.object(daily, "read_keychain", side_effect=RuntimeError("Keychain 讀不到 'svc'")), \
+             mock.patch.object(daily, "has_cli", return_value=True), \
+             mock.patch.object(daily, "run", return_value=0), \
+             mock.patch.object(daily, "notify", lambda mode, msg: notes.append(msg)), \
+             mock.patch.object(daily, "log", lambda *a, **k: None), \
+             mock.patch.object(daily.subprocess, "run", return_value=mock.Mock(returncode=0)):
+            self.assertEqual(daily.check("simulation"), 1)
+        self.assertIn("Keychain", notes[-1])
