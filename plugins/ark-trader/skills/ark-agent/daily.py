@@ -281,8 +281,15 @@ def model_command(cli, prompt, model, tools):
     codex 只接決策層：複盤要改準則檔，給它寫入權限就打破「決策層唯讀」這條不變量。
     """
     if cli == CLAUDE:
+        # 不讀 ~/.claude 的 plugins／hooks／MCP／skills／CLAUDE.md：決策與複盤需要的只有
+        # prompt 與它指到的檔案，個人設定只會加開銷、讓結果隨機器漂移。--tools 限定工具組，
+        # Bash 等工具根本不存在。不用 --bare：實測它開不出 WebSearch／Write。
         return ["claude", "-p", prompt,
                 "--model", model,
+                "--setting-sources", "project",
+                "--strict-mcp-config",
+                "--disable-slash-commands",
+                "--tools", *tools,
                 "--allowedTools", *tools,
                 "--permission-mode", "acceptEdits",
                 "--output-format", "text"]

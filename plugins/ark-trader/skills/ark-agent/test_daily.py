@@ -553,12 +553,24 @@ class TestDecisionCli(unittest.TestCase):
 
     PROMPT = "你是 ark-agent 的決策層"
 
-    def test_claude指令與原本相同(self):
+    def test_claude指令_不讀個人設定_工具只剩指定的(self):
+        """實測：不隔離時載入 ~/.claude 的 plugins／MCP／CLAUDE.md，fable 每次固定開銷 $0.47→$0.21；
+        --tools 讓 Bash 等工具根本不存在（原本只是沒放行）"""
         cmd = daily.model_command("claude", self.PROMPT, "fable", daily.DECIDE_TOOLS)
         self.assertEqual(cmd, ["claude", "-p", self.PROMPT, "--model", "fable",
+                               "--setting-sources", "project", "--strict-mcp-config",
+                               "--disable-slash-commands",
+                               "--tools", "Read", "Write", "WebSearch", "WebFetch",
                                "--allowedTools", "Read", "Write", "WebSearch", "WebFetch",
                                "--permission-mode", "acceptEdits", "--output-format", "text"])
         self.assertNotIn("Bash", cmd)
+        self.assertNotIn("--bare", cmd)          # 實測 --bare 下 WebSearch／Write 開不出來
+
+    def test_claude複盤工具組含Edit(self):
+        cmd = daily.model_command("claude", self.PROMPT, "fable", daily.REVIEW_TOOLS)
+        i = cmd.index("--tools")
+        self.assertEqual(cmd[i + 1:i + 4], ["Read", "Write", "Edit"])
+        self.assertEqual(cmd[i + 4], "--allowedTools")
 
     def test_codex用exec_唯讀沙箱_不讀個人設定(self):
         cmd = daily.model_command("codex", self.PROMPT, "gpt-5", daily.DECIDE_TOOLS)
