@@ -195,7 +195,7 @@ agent 判斷。兩種都**只產出決策 JSON、不送單**——紀律驗證�
 
 | `ARK_DECISION_CLI` | 指令 | 權限 | `ARK_DECISION_MODEL` 未設時 |
 |---|---|---|---|
-| `claude`（預設） | `claude -p` | 只給 Read／Write／WebSearch／WebFetch，不給 Bash；模型自己寫決策檔 | `fable`（額度耗盡改 `ARK_DECISION_FALLBACK`，預設 `opus`） |
+| `claude`（預設） | `claude -p --setting-sources project --strict-mcp-config --disable-slash-commands --tools …` | 不讀 `~/.claude` 的 plugins／hooks／MCP／skills／CLAUDE.md；工具只有 Read／Write／WebSearch／WebFetch（Bash 不存在）；模型自己寫決策檔 | `fable`（額度耗盡改 `ARK_DECISION_FALLBACK`，預設 `opus`） |
 | `codex` | `codex exec --sandbox read-only --ignore-user-config --skip-git-repo-check -c web_search="live" -c model_reasoning_effort="xhigh"` | 唯讀沙箱：寫不了檔、指令連不了網；決策 JSON 由最終訊息（stdout）交回，`daily.py` 代寫決策檔 | 不帶 `-m`，用 Codex 預設模型；不做額度降級 |
 
 ```bash
